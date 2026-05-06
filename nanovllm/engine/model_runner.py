@@ -14,16 +14,18 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event] = None, standalone: bool = False):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager
+        self.enforce_eager = config.enforce_eager if not standalone else True
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.standalone = standalone
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        if not standalone:
+            dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
@@ -38,7 +40,7 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
+        if not standalone and self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
@@ -48,7 +50,7 @@ class ModelRunner:
                 self.loop()
 
     def exit(self):
-        if self.world_size > 1:
+        if not self.standalone and self.world_size > 1:
             self.shm.close()
             dist.barrier()
             if self.rank == 0:
@@ -56,7 +58,8 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        if not self.standalone:
+            dist.destroy_process_group()
 
     def loop(self):
         while True:
