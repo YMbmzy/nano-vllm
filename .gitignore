@@ -196,3 +196,5 @@ cython_debug/
 
 # User
 CLAUDE.md
+Qwen3-*
+results

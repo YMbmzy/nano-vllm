@@ -8,8 +8,8 @@ Runs two experiments:
 
 Usage:
     python benchmarks/hybrid_migration_bench.py \
-        --model /path/to/Qwen3-4B \
-        --block-size 64 \
+        --model ./Qwen3-4B \
+        --block-size 256 \
         --num-repeats 5 \
         --output-dir results
 """
@@ -418,7 +418,7 @@ def main():
     parser = argparse.ArgumentParser(description="Hybrid Migration Benchmark")
     parser.add_argument("--model", type=str, required=True,
                         help="Path to Qwen3 model directory")
-    parser.add_argument("--block-size", type=int, default=64)
+    parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--num-repeats", type=int, default=5)
     parser.add_argument("--exp1-n", type=int, default=None,
                         help="Fixed N for exp1. Auto-calibrate if omitted.")
@@ -429,7 +429,9 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    result_queue = mp.Queue()
+    # result_queue = mp.Queue()
+    ctx = mp.get_context("spawn")                                                                                                                         
+    result_queue = ctx.Queue()  
     mp.spawn(worker_fn, args=(2, args, result_queue), nprocs=2, join=True)
 
     # -- collect and plot --
