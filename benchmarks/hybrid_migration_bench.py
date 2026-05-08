@@ -6,12 +6,22 @@ Runs two experiments:
   Exp 1: α sweep at fixed N  →  T_total vs α
   Exp 2: N sweep at fixed α* →  T_total vs N  (3 strategies)
 
-Usage:
+Usage (single-machine, 2 GPUs):
     python benchmarks/hybrid_migration_bench.py \
         --model ./Qwen3-4B \
         --block-size 256 \
         --num-repeats 5 \
         --output-dir results
+
+Usage (cross-machine, 1 GPU each):
+    # Machine 0 (src):
+    python benchmarks/hybrid_migration_bench.py \
+        --model ./Qwen3-4B \
+        --rank 0 --master-addr <MACHINE_0_IP> --master-port 29500
+    # Machine 1 (dst):
+    python benchmarks/hybrid_migration_bench.py \
+        --model ./Qwen3-4B \
+        --rank 1 --master-addr <MACHINE_0_IP> --master-port 29500
 """
 
 import argparse
@@ -80,13 +90,15 @@ def verify_migration(engine: MigrationEngine, token_ids: list[int],
     # -- decode on both sides --
     if engine.rank == 0:
         baseline = engine.greedy_decode(engine.src, engine.src_bm, src_seq, num_decode)
-        baseline_t = torch.tensor(baseline, dtype=torch.int64, device="cuda:0")
+        device = f"cuda:{engine.src.rank}"
+        baseline_t = torch.tensor(baseline, dtype=torch.int64, device=device)
         dist.send(baseline_t, dst=1)
         engine.cleanup_src(src_seq)
         return True
     else:
         migrated = engine.greedy_decode(engine.dst, engine.dst_bm, dst_seq, num_decode)
-        baseline_t = torch.empty(num_decode, dtype=torch.int64, device="cuda:1")
+        device = f"cuda:{engine.dst.rank}"
+        baseline_t = torch.empty(num_decode, dtype=torch.int64, device=device)
         dist.recv(baseline_t, src=0)
         engine.cleanup_dst(dst_seq)
         ok = migrated == baseline_t.tolist()
@@ -153,7 +165,7 @@ def run_exp1(engine: MigrationEngine, token_ids: list[int],
 
 def run_exp2(engine: MigrationEngine, prompt_tokens: list[int],
              alpha_star: float, num_repeats: int) -> list[dict]:
-    Ns = [256, 512, 1024, 2048, 4096]
+    Ns = [512, 1024, 2048, 4096]
     strategies = {"kv_migration": 0.0, "token_migration": 1.0, "hybrid": alpha_star}
     results = []
 
@@ -216,7 +228,8 @@ def calibrate(engine: MigrationEngine, prompt_tokens: list[int]) -> int:
                 best_N = N
 
     # broadcast chosen N from rank 1 to rank 0
-    n_tensor = torch.tensor([best_N], dtype=torch.int64, device=f"cuda:{engine.rank}")
+    runner = engine.src if engine.rank == 0 else engine.dst
+    n_tensor = torch.tensor([best_N], dtype=torch.int64, device=f"cuda:{runner.rank}")
     dist.broadcast(n_tensor, src=1)
     return n_tensor.item()
 
@@ -306,8 +319,12 @@ def worker_fn(rank: int, world_size: int, args, result_queue):
     os.environ["MASTER_PORT"] = str(args.master_port)
     dist.init_process_group("nccl", world_size=world_size, rank=rank)
 
+    # cross-machine: each machine has 1 GPU (cuda:0)
+    # single-machine: rank 0 → cuda:0, rank 1 → cuda:1
+    gpu_id = 0 if args.rank is not None else rank
+
     if rank == 1:
-        print(f"[rank {rank}] NCCL initialized")
+        print(f"[rank {rank}] NCCL initialized, gpu_id={gpu_id}")
 
     # -- create runner (monkey-patched, full model) --
     config = Config(
@@ -318,7 +335,7 @@ def worker_fn(rank: int, world_size: int, args, result_queue):
         max_model_len=8192,
     )
     Sequence.block_size = config.kvcache_block_size
-    runner = create_runner(rank, config)
+    runner = create_runner(gpu_id, config)
     bm = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
 
     if rank == 1:
@@ -384,7 +401,7 @@ def worker_fn(rank: int, world_size: int, args, result_queue):
         print(f"  → α* = {alpha_star:.1f}")
 
     # broadcast α* to rank 0
-    a_tensor = torch.tensor([alpha_star], dtype=torch.float32, device=f"cuda:{rank}")
+    a_tensor = torch.tensor([alpha_star], dtype=torch.float32, device=f"cuda:{gpu_id}")
     dist.broadcast(a_tensor, src=1)
     alpha_star = a_tensor.item()
 
@@ -399,12 +416,27 @@ def worker_fn(rank: int, world_size: int, args, result_queue):
     #  Collect results
     # ============================================================ #
     if rank == 1:
-        result_queue.put({
+        data = {
             "exp1": exp1_results,
             "exp2": exp2_results,
             "chosen_N": chosen_N,
             "alpha_star": alpha_star,
-        })
+        }
+        if result_queue is not None:
+            result_queue.put(data)
+        else:
+            # cross-machine mode: save to file directly
+            os.makedirs(args.output_dir, exist_ok=True)
+            json_path = os.path.join(args.output_dir, "results.json")
+            with open(json_path, "w") as f:
+                json.dump(data, f, indent=2)
+            print(f"\nRaw results → {json_path}")
+            if data["exp1"]:
+                plot_exp1(data["exp1"], chosen_N,
+                          os.path.join(args.output_dir, "exp1_alpha_sweep.png"))
+            if data["exp2"]:
+                plot_exp2(data["exp2"], alpha_star,
+                          os.path.join(args.output_dir, "exp2_n_sweep.png"))
 
     dist.barrier()
     dist.destroy_process_group()
@@ -425,33 +457,37 @@ def main():
     parser.add_argument("--output-dir", type=str, default="results")
     parser.add_argument("--master-addr", type=str, default="localhost")
     parser.add_argument("--master-port", type=int, default=29500)
+    parser.add_argument("--rank", type=int, default=None,
+                        help="Manual rank for cross-machine mode. "
+                             "Omit for single-machine (mp.spawn).")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # result_queue = mp.Queue()
-    ctx = mp.get_context("spawn")                                                                                                                         
-    result_queue = ctx.Queue()  
-    mp.spawn(worker_fn, args=(2, args, result_queue), nprocs=2, join=True)
-
-    # -- collect and plot --
-    if not result_queue.empty():
-        data = result_queue.get()
-        # save raw data
-        json_path = os.path.join(args.output_dir, "results.json")
-        with open(json_path, "w") as f:
-            json.dump(data, f, indent=2)
-        print(f"\nRaw results → {json_path}")
-
-        N = data["chosen_N"]
-        alpha_star = data["alpha_star"]
-
-        if data["exp1"]:
-            plot_exp1(data["exp1"], N, os.path.join(args.output_dir, "exp1_alpha_sweep.png"))
-        if data["exp2"]:
-            plot_exp2(data["exp2"], alpha_star, os.path.join(args.output_dir, "exp2_n_sweep.png"))
+    if args.rank is not None:
+        # cross-machine: each machine runs this script with its own --rank
+        worker_fn(args.rank, 2, args, result_queue=None)
     else:
-        print("No results collected (queue empty).")
+        # single-machine: spawn both workers locally
+        ctx = mp.get_context("spawn")
+        result_queue = ctx.Queue()
+        mp.spawn(worker_fn, args=(2, args, result_queue), nprocs=2, join=True)
+
+        if not result_queue.empty():
+            data = result_queue.get()
+            json_path = os.path.join(args.output_dir, "results.json")
+            with open(json_path, "w") as f:
+                json.dump(data, f, indent=2)
+            print(f"\nRaw results → {json_path}")
+
+            N = data["chosen_N"]
+            alpha_star = data["alpha_star"]
+            if data["exp1"]:
+                plot_exp1(data["exp1"], N, os.path.join(args.output_dir, "exp1_alpha_sweep.png"))
+            if data["exp2"]:
+                plot_exp2(data["exp2"], alpha_star, os.path.join(args.output_dir, "exp2_n_sweep.png"))
+        else:
+            print("No results collected (queue empty).")
 
 
 if __name__ == "__main__":
