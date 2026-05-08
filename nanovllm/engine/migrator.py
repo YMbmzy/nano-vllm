@@ -99,20 +99,15 @@ class MigrationEngine:
                     buf[:, :, i].copy_(self.src.kv_cache[:, :, src_bid])
                 torch.cuda.synchronize()
 
-        # ---- inflate buffer to simulate lower bandwidth ----
         K = self.bandwidth_scale
-        if buf is not None and K > 1:
-            send_buf = buf.unsqueeze(0).expand(K, *buf.shape).contiguous()
-        else:
-            send_buf = buf
 
         # ==================== TIMED SECTION (rank 1) ==================== #
         dist.barrier()
 
         if self.rank == 0:
-            # src: just send the (inflated) buffer
-            if send_buf is not None:
-                dist.send(send_buf, dst=1)
+            if buf is not None:
+                for _ in range(K):
+                    dist.send(buf, dst=1)
             return 0.0, None
 
         # ---- rank 1: timed migration ----
@@ -120,12 +115,12 @@ class MigrationEngine:
             torch.cuda.synchronize()
             t_start = time.perf_counter()
 
-            # -- launch async recv on transfer stream --
-            transfer_done = None
-            if send_buf is not None:
-                transfer_done = dist.irecv(send_buf, src=0)
+            # -- async recv first round (real data) --
+            recv_work = None
+            if buf is not None:
+                recv_work = dist.irecv(buf, src=0)
 
-            # -- launch recompute on compute stream --
+            # -- launch recompute (overlaps with all recv rounds) --
             compute_stream = torch.cuda.Stream()
             if split_idx > 0:
                 recompute_seq = Sequence(token_ids[:split_idx])
@@ -137,19 +132,17 @@ class MigrationEngine:
                     self.dst.run_model(input_ids, positions, is_prefill=True)
                     reset_context()
 
-            # -- wait for recv --
-            if transfer_done is not None:
-                transfer_done.wait()
-
-            # -- extract real data from inflated buffer --
-            if send_buf is not None and K > 1:
-                buf = send_buf[0]
-
-            # -- unpack buffer into dst KV cache --
-            if buf is not None:
+            # -- wait first recv, unpack real data --
+            if recv_work is not None:
+                recv_work.wait()
                 for i in range(num_transfer_blocks):
                     dst_bid = dst_seq.block_table[start_block + i]
                     self.dst.kv_cache[:, :, dst_bid].copy_(buf[:, :, i])
+
+            # -- K-1 padding rounds: recv into same buf (data discarded) --
+            if buf is not None:
+                for _ in range(K - 1):
+                    dist.recv(buf, src=0)
 
             # -- wait for recompute --
             compute_stream.synchronize()
