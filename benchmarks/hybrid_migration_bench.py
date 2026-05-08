@@ -10,7 +10,7 @@ Usage (single-machine, 2 GPUs):
     python benchmarks/hybrid_migration_bench.py \
         --model ./Qwen3-4B \
         --block-size 256 \
-        --bandwidth-scale 3 \
+        --bandwidth-scale 4 \
         --num-repeats 5 \
         --output-dir results
 
@@ -166,7 +166,7 @@ def run_exp1(engine: MigrationEngine, token_ids: list[int],
 
 def run_exp2(engine: MigrationEngine, prompt_tokens: list[int],
              alpha_star: float, num_repeats: int) -> list[dict]:
-    Ns = [512, 1024, 2048, 4096]
+    Ns = [1024, 2048, 4096, 8192]
     strategies = {"kv_migration": 0.0, "token_migration": 1.0, "hybrid": alpha_star}
     results = []
 
@@ -207,8 +207,8 @@ def run_exp2(engine: MigrationEngine, prompt_tokens: list[int],
 def calibrate(engine: MigrationEngine, prompt_tokens: list[int]) -> int:
     """Test candidate Ns and pick the one where transfer and recompute
     times are closest. Returns the chosen N."""
-    candidates = [512, 1024, 2048, 4096]
-    best_N, best_ratio = 1024, float("inf")
+    candidates = [1024, 2048, 4096, 8192]
+    best_N, best_ratio = 4096, float("inf")
 
     for N in candidates:
         if N > len(prompt_tokens):
