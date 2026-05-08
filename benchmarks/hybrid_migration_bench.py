@@ -542,9 +542,7 @@ def worker_fn(rank: int, world_size: int, args, result_queue):
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     chunk = "The quick brown fox jumps over the lazy dog. "
     chunk_tokens = tokenizer.encode(chunk, add_special_tokens=False)
-    chunks_needed = config.max_model_len // len(chunk_tokens) + 2
-    prompt_tokens = tokenizer.encode(chunk * chunks_needed, add_special_tokens=False)
-    prompt_tokens = prompt_tokens[:config.max_model_len]
+    prompt_tokens = (chunk_tokens * (config.max_model_len // len(chunk_tokens) + 2))[:config.max_model_len]
     assert len(prompt_tokens) == config.max_model_len, \
         f"got {len(prompt_tokens)}, need {config.max_model_len}"
     if rank == 1:
