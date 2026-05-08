@@ -16,12 +16,14 @@ class MigrationEngine:
     """
 
     def __init__(self, rank: int, src_runner: ModelRunner | None, dst_runner: ModelRunner | None,
-                 src_bm: BlockManager | None, dst_bm: BlockManager | None):
+                 src_bm: BlockManager | None, dst_bm: BlockManager | None,
+                 bandwidth_scale: int = 1):
         self.rank = rank
         self.src = src_runner      # only meaningful on rank 0
         self.dst = dst_runner      # only meaningful on rank 1
         self.src_bm = src_bm
         self.dst_bm = dst_bm
+        self.bandwidth_scale = bandwidth_scale
 
         runner = src_runner if rank == 0 else dst_runner
         self.block_size = runner.block_size
@@ -97,13 +99,20 @@ class MigrationEngine:
                     buf[:, :, i].copy_(self.src.kv_cache[:, :, src_bid])
                 torch.cuda.synchronize()
 
+        # ---- inflate buffer to simulate lower bandwidth ----
+        K = self.bandwidth_scale
+        if buf is not None and K > 1:
+            send_buf = buf.unsqueeze(0).expand(K, *buf.shape).contiguous()
+        else:
+            send_buf = buf
+
         # ==================== TIMED SECTION (rank 1) ==================== #
         dist.barrier()
 
         if self.rank == 0:
-            # src: just send the buffer
-            if buf is not None:
-                dist.send(buf, dst=1)
+            # src: just send the (inflated) buffer
+            if send_buf is not None:
+                dist.send(send_buf, dst=1)
             return 0.0, None
 
         # ---- rank 1: timed migration ----
@@ -113,8 +122,8 @@ class MigrationEngine:
 
             # -- launch async recv on transfer stream --
             transfer_done = None
-            if buf is not None:
-                transfer_done = dist.irecv(buf, src=0)
+            if send_buf is not None:
+                transfer_done = dist.irecv(send_buf, src=0)
 
             # -- launch recompute on compute stream --
             compute_stream = torch.cuda.Stream()
@@ -131,6 +140,10 @@ class MigrationEngine:
             # -- wait for recv --
             if transfer_done is not None:
                 transfer_done.wait()
+
+            # -- extract real data from inflated buffer --
+            if send_buf is not None and K > 1:
+                buf = send_buf[0]
 
             # -- unpack buffer into dst KV cache --
             if buf is not None:

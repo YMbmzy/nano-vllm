@@ -10,6 +10,7 @@ Usage (single-machine, 2 GPUs):
     python benchmarks/hybrid_migration_bench.py \
         --model ./Qwen3-4B \
         --block-size 256 \
+        --bandwidth-scale 3 \
         --num-repeats 5 \
         --output-dir results
 
@@ -347,7 +348,8 @@ def worker_fn(rank: int, world_size: int, args, result_queue):
     dst_runner = runner if rank == 1 else None
     src_bm = bm if rank == 0 else None
     dst_bm = bm if rank == 1 else None
-    engine = MigrationEngine(rank, src_runner, dst_runner, src_bm, dst_bm)
+    engine = MigrationEngine(rank, src_runner, dst_runner, src_bm, dst_bm,
+                             bandwidth_scale=args.bandwidth_scale)
 
     # -- tokenize a long prompt (both ranks use the same tokens) --
     from transformers import AutoTokenizer
@@ -460,6 +462,9 @@ def main():
     parser.add_argument("--rank", type=int, default=None,
                         help="Manual rank for cross-machine mode. "
                              "Omit for single-machine (mp.spawn).")
+    parser.add_argument("--bandwidth-scale", type=int, default=1,
+                        help="Inflate transfer buffer Kx to simulate 1/K bandwidth. "
+                             "K=3 recommended for A100 PCIe.")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
