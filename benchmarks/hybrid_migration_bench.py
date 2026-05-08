@@ -125,6 +125,7 @@ def run_one(engine: MigrationEngine, token_ids: list[int], alpha: float) -> floa
         engine.cleanup_src(src_seq)
     else:
         engine.cleanup_dst(dst_seq)
+    torch.cuda.empty_cache()
     return t if engine.rank == 1 else 0.0
 
 
