@@ -130,6 +130,37 @@ def run_one(engine: MigrationEngine, token_ids: list[int], alpha: float) -> floa
 
 
 # ====================================================================== #
+#  Brute-force α sweep for a single N (used by exp2)
+# ====================================================================== #
+
+def bruteforce_optimal(engine: MigrationEngine, token_ids: list[int],
+                       num_repeats: int, alpha_step: float = 0.05) -> dict | None:
+    """Sweep α at the given N, return the result dict for the best α.
+
+    Only populated on rank 1; returns None on rank 0.
+    """
+    alphas = [round(i * alpha_step, 2) for i in range(int(1.0 / alpha_step) + 1)]
+    N = len(token_ids)
+    best = None
+
+    for alpha in alphas:
+        run_one(engine, token_ids, alpha)  # warmup
+        times = [run_one(engine, token_ids, alpha) for _ in range(num_repeats)]
+
+        if engine.rank == 1:
+            times.sort()
+            median = times[len(times) // 2]
+            if best is None or median < best["median"]:
+                actual_alpha = engine.compute_split(N, alpha) / N
+                best = dict(N=N, strategy="hybrid_bruteforce", alpha=alpha,
+                            actual_alpha=actual_alpha,
+                            median=median, min=min(times), max=max(times),
+                            all=times)
+
+    return best
+
+
+# ====================================================================== #
 #  Experiment 1: α sweep
 # ====================================================================== #
 
@@ -198,6 +229,14 @@ def run_exp2(engine: MigrationEngine, prompt_tokens: list[int],
                 print(f"  N={N} {name:20s} (α={alpha:.2f}): "
                       f"median={r['median']:.2f} ms  "
                       f"[{r['min']:.2f}, {r['max']:.2f}]")
+
+        # brute-force optimal α for this N
+        bf = bruteforce_optimal(engine, token_ids, num_repeats)
+        if engine.rank == 1 and bf:
+            results.append(bf)
+            print(f"  N={N} {'hybrid_bruteforce':20s} (α={bf['alpha']:.2f}): "
+                  f"median={bf['median']:.2f} ms  "
+                  f"[{bf['min']:.2f}, {bf['max']:.2f}]")
 
     return results
 
@@ -415,6 +454,14 @@ def run_exp2_profile(engine: MigrationEngine, prompt_tokens: list[int],
                 print(f"  N={N} {name:20s} (α={alpha:.2f}): "
                       f"median={r['median']:.2f} ms  "
                       f"[{r['min']:.2f}, {r['max']:.2f}]")
+
+        # brute-force optimal α for this N
+        bf = bruteforce_optimal(engine, token_ids, num_repeats)
+        if engine.rank == 1 and bf:
+            results.append(bf)
+            print(f"  N={N} {'hybrid_bruteforce':20s} (α={bf['alpha']:.2f}): "
+                  f"median={bf['median']:.2f} ms  "
+                  f"[{bf['min']:.2f}, {bf['max']:.2f}]")
     return results
 
 
@@ -469,12 +516,15 @@ def plot_exp2(results: list[dict], alpha_star, output_path: str):
         hybrid_label = f"Hybrid (α={alpha_star:.2f})"
     labels = {"kv_migration": "KV Migration (α=0)",
               "token_migration": "Token Migration (α=1)",
-              "hybrid": hybrid_label}
-    colors = {"kv_migration": "#1f77b4", "token_migration": "#ff7f0e", "hybrid": "#2ca02c"}
-    markers = {"kv_migration": "s", "token_migration": "^", "hybrid": "o"}
+              "hybrid": hybrid_label,
+              "hybrid_bruteforce": "Hybrid (brute-force α*)"}
+    colors = {"kv_migration": "#1f77b4", "token_migration": "#ff7f0e",
+              "hybrid": "#2ca02c", "hybrid_bruteforce": "#d62728"}
+    markers = {"kv_migration": "s", "token_migration": "^",
+               "hybrid": "o", "hybrid_bruteforce": "D"}
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    for strat in ["kv_migration", "token_migration", "hybrid"]:
+    for strat in ["kv_migration", "token_migration", "hybrid", "hybrid_bruteforce"]:
         data = [r for r in results if r["strategy"] == strat]
         if not data:
             continue
