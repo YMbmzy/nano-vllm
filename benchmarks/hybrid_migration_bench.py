@@ -168,7 +168,7 @@ def run_exp1(engine: MigrationEngine, token_ids: list[int],
 
 def run_exp2(engine: MigrationEngine, prompt_tokens: list[int],
              alpha_star: float, num_repeats: int) -> list[dict]:
-    Ns = [1024, 2048, 4096, 8192]
+    Ns = [1024, 2048, 4096, 8192, 8192 * 2]
     strategies = {"kv_migration": 0.0, "token_migration": 1.0, "hybrid": alpha_star}
     results = []
 
@@ -209,7 +209,7 @@ def run_exp2(engine: MigrationEngine, prompt_tokens: list[int],
 def calibrate(engine: MigrationEngine, prompt_tokens: list[int]) -> int:
     """Test candidate Ns and pick the one where transfer and recompute
     times are closest. Returns the chosen N."""
-    candidates = [1024, 2048, 4096, 8192]
+    candidates = [1024, 2048, 4096, 8192, 8192 * 2]
     best_N, best_ratio = 4096, float("inf")
 
     for N in candidates:
@@ -242,13 +242,13 @@ def calibrate(engine: MigrationEngine, prompt_tokens: list[int]) -> int:
 # ====================================================================== #
 
 def run_profiling(engine: MigrationEngine, prompt_tokens: list[int],
-                  num_repeats: int = 5, step: int = 512) -> tuple[list, list]:
+                  num_repeats: int = 5, step: int = 1024) -> tuple[list, list]:
     """Measure T_transfer(N) and T_compute(N) at dense N grid.
 
     Returns (compute_data, transfer_data) — lists of (N, T_median_ms).
     Only populated on rank 1; empty on rank 0.
     """
-    Ns = list(range(step, 8192 + 1, step))
+    Ns = list(range(step, 8192 * 2 + 1, step))
     compute_data, transfer_data = [], []
 
     for N in Ns:
@@ -444,8 +444,8 @@ def plot_exp1(results: list[dict], N: int, output_path: str):
                 fontsize=9, ha="right")
     ax.annotate(f"Hybrid Optimum\n(α*≈{alphas[min_idx]:.2f})",
                 xy=(alphas[min_idx], medians[min_idx]),
-                xytext=(alphas[min_idx], medians[min_idx] * 0.82),
-                fontsize=9, ha="center",
+                xytext=(alphas[min_idx], medians[min_idx] * 1.18),
+                fontsize=9, ha="center", va="bottom",
                 arrowprops=dict(arrowstyle="->", color="red"))
 
     ax.set_xlabel("α (recompute fraction)", fontsize=12)
@@ -520,7 +520,7 @@ def worker_fn(rank: int, world_size: int, args, result_queue):
         enforce_eager=True,
         tensor_parallel_size=1,
         kvcache_block_size=args.block_size,
-        max_model_len=8192,
+        max_model_len=8192 * 2,
     )
     Sequence.block_size = config.kvcache_block_size
     runner = create_runner(gpu_id, config)
@@ -574,7 +574,7 @@ def worker_fn(rank: int, world_size: int, args, result_queue):
     # ============================================================ #
     #  Branch: --profile vs --no-profile
     # ============================================================ #
-    exp2_Ns = [1024, 2048, 4096, 8192]
+    exp2_Ns = [1024, 2048, 4096, 8192, 8192 * 2]
 
     if args.profile:
         # ====== PROFILE PATH ====== #
