@@ -574,40 +574,42 @@ def run_one_iterative(engine: MigrationEngine, token_ids: list[int],
 
 
 def verify_iterative_migration(engine: MigrationEngine, token_ids: list[int],
-                                alpha: float, max_decode: int,
-                                num_check: int = 20) -> bool:
-    """Correctness check for iterative migration.
+                                alpha: float, max_decode: int) -> bool:
+    """方案B：独立比较 dst 生成的 max_decode 个 token 与纯 src 解码结果。
 
-    After iterative migration completes (src decoded + dst decoded = max_decode),
-    decode num_check more tokens on both sides and compare.
+    rank 0: prefill + 独立解码 max_decode 个 token → 基线
+    rank 1: 执行 migrate_iterative，dst 端得到 N + max_decode 个 token
+    比较 dst 端新增的 max_decode 个 token 是否与基线一致。
     """
-    src_seq = None
+    N = len(token_ids)
     if engine.rank == 0:
+        # 1. prefill 构建 KV cache
         src_seq = engine.prefill_src(token_ids)
-    _, dst_seq, stats = engine.migrate_iterative(
-        token_ids, alpha, src_seq=src_seq, max_decode=max_decode)
-
-    dist.barrier()
-
-    if engine.rank == 0:
-        # src continues decoding num_check more tokens for baseline
-        baseline = engine.greedy_decode(engine.src, engine.src_bm, src_seq, num_check)
+        # 2. 独立解码 max_decode 个 token 作为基线
+        baseline = engine.greedy_decode(engine.src, engine.src_bm, src_seq, max_decode)
         device = f"cuda:{engine.src.rank}"
         baseline_t = torch.tensor(baseline, dtype=torch.int64, device=device)
+        # 发送基线给 rank 1
         dist.send(baseline_t, dst=1)
         engine.cleanup_src(src_seq)
         return True
-    else:
-        # dst decodes num_check more tokens
-        migrated = engine.greedy_decode(engine.dst, engine.dst_bm, dst_seq, num_check)
+    else:   # rank == 1
+        # 1. 执行迭代迁移（内部会由 dst 解码完剩余的 max_decode - src_decoded 个 token）
+        _, dst_seq, stats = engine.migrate_iterative(
+            token_ids, alpha, src_seq=None, max_decode=max_decode)
+        # 2. 取出迁移后 dst 新增的所有 token（N 之后的部分）
+        migrated = dst_seq.token_ids[N:]   # 长度应为 max_decode
+        # 3. 接收基线
         device = f"cuda:{engine.dst.rank}"
-        baseline_t = torch.empty(num_check, dtype=torch.int64, device=device)
+        baseline_t = torch.empty(max_decode, dtype=torch.int64, device=device)
         dist.recv(baseline_t, src=0)
+        baseline = baseline_t.tolist()
         engine.cleanup_dst(dst_seq)
-        ok = migrated == baseline_t.tolist()
+        ok = (migrated == baseline)
         if not ok:
-            print(f"  [rank 1] ITERATIVE MISMATCH: baseline={baseline_t.tolist()[:5]}... "
-                  f"migrated={migrated[:5]}...")
+            print(f"  [rank 1] ITERATIVE MISMATCH: "
+                  f"baseline={baseline[:10]}... "
+                  f"migrated={migrated[:10]}...")
         return ok
 
 
