@@ -1,6 +1,5 @@
 import time
 import math
-import threading
 import torch
 import torch.distributed as dist
 
@@ -318,31 +317,36 @@ class MigrationEngine:
             new_tokens = []
 
             if self.rank == 0:
-                # --- src: blocking NCCL in thread + decode in main thread ---
-                # NCCL is_completed() is unreliable for P2P ops; use threading
-                # instead. Blocking NCCL calls release the GIL, so the main
-                # thread can decode (Python + CUDA kernels) in parallel.
-                src_device = self.src.rank
-                def _nccl_src_work():
-                    torch.cuda.set_device(src_device)
-                    if buf is not None:
-                        for _ in range(K):
-                            dist.send(buf, dst=1)
-                    dist.recv(done_buf, src=1)  # wait until dst signals this round done
+                # --- src: non-blocking isend + decode on the main thread ---
+                # NCCL kernels run on their own internal stream, so isend
+                # returns immediately on the CPU side and lets the main
+                # thread keep launching decode work on the default stream.
+                # This gives real CPU/GPU overlap without the Python-thread
+                # + ProcessGroupNCCL race that caused the heap corruption
+                # in the previous threaded implementation.
+                send_works = []
+                if buf is not None:
+                    for _ in range(K):
+                        send_works.append(dist.isend(buf, dst=1))
 
-                nccl_thread = threading.Thread(target=_nccl_src_work)
-                nccl_thread.start()
-
-                while nccl_thread.is_alive():
-                    if src_decoded < max_decode:
-                        token = self.decode_one_src(src_seq)
-                        new_tokens.append(token)
-                        src_decoded += 1
-                    else:
-                        nccl_thread.join()
+                # Decode while the NCCL sends are in flight. Stop as soon
+                # as all sends have completed so we hand control back to
+                # the round-finalization code promptly.
+                while src_decoded < max_decode:
+                    token = self.decode_one_src(src_seq)
+                    new_tokens.append(token)
+                    src_decoded += 1
+                    if not send_works or all(w.is_completed() for w in send_works):
                         break
 
-                nccl_thread.join()
+                # Safety net: wait on anything still pending. wait() is a
+                # no-op for works that already completed.
+                for w in send_works:
+                    w.wait()
+
+                # Blocking recv for dst's done signal — no concurrency
+                # concerns here, the main thread is otherwise idle.
+                dist.recv(done_buf, src=1)
 
             else:  # rank == 1
                 # --- dst: recv + recompute + unpack + signal done ---
