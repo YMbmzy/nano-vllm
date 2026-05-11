@@ -190,7 +190,7 @@ class MigrationEngine:
         """Pure KV migration with iterative catch-up.
 
         Each round:
-          rank 0: pack & send KV for pending tokens, decode new tokens in parallel
+          rank 0: pack & send KV for pending tokens, decode new tokens
           rank 1: recv KV, store into cache
 
         Exit: when gap (unsent tokens) <= 1, src stops decoding, transfers
@@ -257,32 +257,20 @@ class MigrationEngine:
             new_tokens = []
 
             if self.rank == 0:
-                # first send: isend to overlap with decode
-                send_work = None
                 if buf is not None:
-                    send_work = dist.isend(buf, dst=1)
+                    for _ in range(K):
+                        dist.send(buf, dst=1)
 
-                # decode while first send is in flight
+                # decode after the full KV batch has been handed off
                 if should_decode:
                     while src_decoded < max_decode:
                         token = self.decode_one_src(src_seq)
                         new_tokens.append(token)
                         src_decoded += 1
-                        if send_work is not None and send_work.is_completed():
-                            break
-
-                # wait for first send
-                if send_work is not None:
-                    send_work.wait()
-
-                # remaining K-1 sends (blocking, sequential)
-                if buf is not None:
-                    for _ in range(K - 1):
-                        dist.send(buf, dst=1)
 
             else:  # rank 1 (dst)
                 with torch.cuda.device(device):
-                    # first recv (matches rank 0 isend)
+                    # first recv matches rank 0's blocking send
                     if buf is not None:
                         recv_work = dist.irecv(buf, src=0)
                         recv_work.wait()

@@ -623,6 +623,32 @@ def verify_exp3(engine, token_ids, strategy, max_decode):
         engine.cleanup_dst(dst_seq)
         return ok
 
+def _run_exp3_one(engine: MigrationEngine, strategy: str,
+                  token_ids: list[int], max_decode: int) -> tuple[float, dict]:
+    """Run one exp3 data point. Returns (T_total_ms, stats) on rank 1."""
+    src_seq = None
+    if engine.rank == 0:
+        src_seq = engine.prefill_src(token_ids)
+
+    if strategy == "token_migration":
+        t, dst_seq, stats = engine.migrate_token_migration(
+            token_ids, src_seq=src_seq, max_decode=max_decode)
+    elif strategy == "deferred_kv":
+        t, dst_seq, stats = engine.migrate_deferred_kv(
+            token_ids, src_seq=src_seq, max_decode=max_decode)
+    elif strategy == "iterative_kv":
+        t, dst_seq, stats = engine.migrate_iterative(
+            token_ids, src_seq=src_seq, max_decode=max_decode)
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
+    dist.barrier()
+    if engine.rank == 0:
+        engine.cleanup_src(src_seq)
+    else:
+        engine.cleanup_dst(dst_seq)
+    torch.cuda.empty_cache()
+    return (t, stats) if engine.rank == 1 else (0.0, stats)
 
 def run_exp3(engine: MigrationEngine, prompt_tokens: list[int],
              num_repeats: int) -> list[dict]:
