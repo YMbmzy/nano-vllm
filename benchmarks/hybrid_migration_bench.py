@@ -553,37 +553,21 @@ def plot_exp2(results: list[dict], alpha_star, output_path: str):
 #  Experiment 3: decode-phase migration — three strategies
 # ====================================================================== #
 
-def _run_exp3_one(engine: MigrationEngine, strategy: str,
-                  token_ids: list[int], max_decode: int) -> tuple[float, dict]:
-    """Run one exp3 data point. Returns (T_total_ms, stats) on rank 1."""
-    src_seq = None
-    if engine.rank == 0:
-        src_seq = engine.prefill_src(token_ids)
-
-    if strategy == "token_migration":
-        t, dst_seq, stats = engine.migrate_token_migration(
-            token_ids, src_seq=src_seq, max_decode=max_decode)
-    elif strategy == "deferred_kv":
-        t, dst_seq, stats = engine.migrate_deferred_kv(
-            token_ids, src_seq=src_seq, max_decode=max_decode)
-    elif strategy == "iterative_kv":
-        t, dst_seq, stats = engine.migrate_iterative(
-            token_ids, src_seq=src_seq, max_decode=max_decode)
-    else:
-        raise ValueError(f"Unknown strategy: {strategy}")
-
-    dist.barrier()
-    if engine.rank == 0:
-        engine.cleanup_src(src_seq)
-    else:
-        engine.cleanup_dst(dst_seq)
-    torch.cuda.empty_cache()
-    return (t, stats) if engine.rank == 1 else (0.0, stats)
-
-
 def verify_exp3(engine, token_ids, strategy, max_decode):
+    """Verify decode-phase migration correctness.
+
+    Baseline: src has prefilled N tokens; we ask src to decode max_decode more
+    steps using its original KV (untouched by migration since src_seq is kept
+    intact across all strategies). This is the ground truth for dst comparison.
+
+    For token_migration/deferred_kv: src didn't decode during migration, so
+    src_seq still has only N tokens — decode max_decode more.
+    For iterative_kv: src may have decoded some tokens during migration; we
+    continue from wherever it left off until reaching max_decode total.
+    """
     N = len(token_ids)
-    # Both ranks execute the migration strategy together.
+
+    # ---- Run migration on both ranks ----
     src_seq = None
     if engine.rank == 0:
         src_seq = engine.prefill_src(token_ids)
@@ -600,24 +584,42 @@ def verify_exp3(engine, token_ids, strategy, max_decode):
     else:
         raise ValueError(strategy)
 
+    dist.barrier()
+
     if engine.rank == 0:
-        # After migration, src_seq still holds all tokens + KV.
-        baseline = src_seq.token_ids[N:N+max_decode]
+        # src may or may not have decoded during migration. Continue decoding
+        # until src_seq holds exactly N + max_decode tokens.
+        already_decoded = len(src_seq.token_ids) - N
+        remaining = max_decode - already_decoded
+        for _ in range(remaining):
+            engine.decode_one_src(src_seq)
+
+        baseline = src_seq.token_ids[N:N + max_decode]
+        assert len(baseline) == max_decode, (
+            f"baseline length mismatch: got {len(baseline)}, need {max_decode}")
         baseline_t = torch.tensor(baseline, dtype=torch.int64,
                                   device=f'cuda:{engine.src.rank}')
         dist.send(baseline_t, dst=1)
         engine.cleanup_src(src_seq)
         return True
+
     else:
         baseline_t = torch.empty(max_decode, dtype=torch.int64,
                                  device=f'cuda:{engine.dst.rank}')
         dist.recv(baseline_t, src=0)
         baseline = baseline_t.tolist()
-        migrated = dst_seq.token_ids[N:N+max_decode]
+
+        migrated = dst_seq.token_ids[N:N + max_decode]
         ok = (len(migrated) == max_decode and migrated == baseline)
         if not ok:
-            print(f"Mismatch: baseline={baseline[:10]}... "
-                  f"migrated={migrated[:10]}...")
+            print(f"  [{strategy}] MISMATCH:")
+            print(f"    baseline (len={len(baseline)}): {baseline[:10]}...")
+            print(f"    migrated (len={len(migrated)}): {migrated[:10]}...")
+            for i, (a, b) in enumerate(zip(baseline, migrated)):
+                if a != b:
+                    print(f"    first diff at position {i}: "
+                          f"baseline={a}, migrated={b}")
+                    break
         engine.cleanup_dst(dst_seq)
         return ok
 
@@ -1024,8 +1026,8 @@ def main():
                 plot_exp2(data["exp2"], data["alpha_star"],
                           os.path.join(args.output_dir, "exp2_n_sweep.png"))
         if data.get("exp3"):
-            plot_exp3(data["exp3"], data["alpha_star"],
-                      os.path.join(args.output_dir, "exp3_iterative.png"))
+            plot_exp3(data["exp3"],
+                      os.path.join(args.output_dir, "exp3_decode_migration.png"))
 
 
 if __name__ == "__main__":

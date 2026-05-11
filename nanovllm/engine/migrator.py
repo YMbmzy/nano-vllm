@@ -361,17 +361,19 @@ class MigrationEngine:
         stats = {"num_rounds": round_num, "src_decoded": src_decoded,
                  "dst_decoded": dst_decoded}
         return t_total, dst_seq, stats
-
+    
     # ------------------------------------------------------------------ #
-    #  Baseline 1 — Token Migration (dst recomputes all KV via prefill)
+    #  Baseline 1 — Token Migration (src idles; dst re-prefills + decodes)
     # ------------------------------------------------------------------ #
     def migrate_token_migration(self, token_ids: list[int],
                                 src_seq: Sequence | None = None,
                                 max_decode: int | None = None,
                                 ) -> tuple[float, 'Sequence | None', dict]:
-        """Baseline: src decodes everything, then dst prefills all tokens.
+        """Baseline: src ships token IDs, dst rebuilds KV via prefill and decodes.
 
-        T_migration = T_decode(D) + T_send_tokens(~0) + T_prefill(N+D).
+        Semantics: migration is triggered right after src finishes prefill.
+        src does no useful work during migration; dst handles all max_decode steps.
+        T_migration = T_send_tokens(~0) + T_prefill(N) on dst + T_decode(max_decode) on dst.
         """
         N = len(token_ids)
         if max_decode is None:
@@ -382,57 +384,68 @@ class MigrationEngine:
         dist.barrier()
         t_start = time.perf_counter() if self.rank == 1 else None
 
-        # Phase 1: src decodes all tokens (rank 1 idles)
-        all_tokens = list(token_ids)
+        # Phase 1: src sends token IDs to dst (src idles otherwise)
         if self.rank == 0:
-            for _ in range(max_decode):
-                token = self.decode_one_src(src_seq)
-                all_tokens.append(token)
-
-        # Phase 2: send token IDs to dst
-        if self.rank == 0:
-            total_t = torch.tensor([len(all_tokens)], dtype=torch.int64, device=f"cuda:{device}")
+            total_t = torch.tensor([N], dtype=torch.int64, device=f"cuda:{device}")
             dist.send(total_t, dst=1)
-            ids_t = torch.tensor(all_tokens, dtype=torch.int64, device=f"cuda:{device}")
+            ids_t = torch.tensor(token_ids, dtype=torch.int64, device=f"cuda:{device}")
             dist.send(ids_t, dst=1)
         else:
             total_t = torch.empty(1, dtype=torch.int64, device=f"cuda:{device}")
             dist.recv(total_t, src=0)
             ids_t = torch.empty(total_t.item(), dtype=torch.int64, device=f"cuda:{device}")
             dist.recv(ids_t, src=0)
-            all_tokens = ids_t.tolist()
 
-        # Phase 3: dst prefills all tokens to rebuild KV
+        # Phase 2: dst re-prefills the N tokens
         dst_seq = None
         if self.rank == 1:
+            recv_ids = ids_t.tolist()
             with torch.cuda.device(device):
-                dst_seq = Sequence(all_tokens)
+                dst_seq = Sequence(recv_ids)
                 for _ in range(dst_seq.num_blocks):
                     dst_seq.block_table.append(self.dst_bm._allocate_block())
                 dst_seq.num_cached_tokens = 0
-                dst_seq.num_scheduled_tokens = len(all_tokens)
+                dst_seq.num_scheduled_tokens = N
                 inp, pos = self.dst.prepare_prefill([dst_seq])
                 self.dst.run_model(inp, pos, is_prefill=True)
                 reset_context()
-                dst_seq.num_cached_tokens = len(all_tokens)
+                dst_seq.num_cached_tokens = N
                 dst_seq.num_scheduled_tokens = 0
                 dst_seq.is_prefill = False
+
+        # Phase 3: dst decodes max_decode steps
+        dst_decoded = 0
+        if self.rank == 1:
+            with torch.cuda.device(device):
+                for _ in range(max_decode):
+                    self.dst_bm.may_append(dst_seq)
+                    dst_seq.num_scheduled_tokens = 1
+                    dst_seq.is_prefill = False
+                    inp, pos = self.dst.prepare_decode([dst_seq])
+                    logits = self.dst.run_model(inp, pos, is_prefill=False)
+                    reset_context()
+                    token = logits[0].argmax().item()
+                    dst_seq.num_cached_tokens += 1
+                    dst_seq.append_token(token)
+                    dst_decoded += 1
                 torch.cuda.synchronize()
 
         t_total = (time.perf_counter() - t_start) * 1000 if self.rank == 1 else 0.0
-        stats = {"num_rounds": 0, "src_decoded": max_decode, "dst_decoded": 0}
+        stats = {"num_rounds": 0, "src_decoded": 0, "dst_decoded": dst_decoded}
         return t_total, dst_seq, stats
 
     # ------------------------------------------------------------------ #
-    #  Baseline 2 — Deferred KV Transfer (src finishes decode, then sends)
+    #  Baseline 2 — Deferred KV (src idles; dst receives KV then decodes)
     # ------------------------------------------------------------------ #
     def migrate_deferred_kv(self, token_ids: list[int],
                             src_seq: Sequence | None = None,
                             max_decode: int | None = None,
                             ) -> tuple[float, 'Sequence | None', dict]:
-        """Baseline: src decodes everything, then transfers complete KV.
+        """Baseline: src ships complete KV (no overlap); dst decodes.
 
-        T_migration = T_decode(D) + T_transfer(N+D).
+        Semantics: migration is triggered right after src finishes prefill.
+        src does no decode during migration — only ships the KV it already has.
+        T_migration = T_transfer(N) + T_decode(max_decode) on dst.
         """
         N = len(token_ids)
         if max_decode is None:
@@ -440,42 +453,34 @@ class MigrationEngine:
         K = self.bandwidth_scale
         device = self.src.rank if self.rank == 0 else self.dst.rank
 
+        num_blocks = math.ceil(N / self.block_size)
+
+        # Pre-pack src KV BEFORE the timer starts is wrong — packing happens
+        # during migration. But we do allocate the buffer outside to match
+        # the iterative path's accounting.
+        buf = torch.empty(
+            *self.kv_block_shape[:-3], num_blocks,
+            *self.kv_block_shape[-3:],
+            dtype=self.kv_dtype, device=f"cuda:{device}")
+
         # ---- sync: migration trigger ----
         dist.barrier()
         t_start = time.perf_counter() if self.rank == 1 else None
 
-        # Phase 1: src decodes all tokens (rank 1 idles)
-        all_tokens = list(token_ids)
+        # Phase 1: send token IDs (so dst can build Sequence)
         if self.rank == 0:
-            for _ in range(max_decode):
-                token = self.decode_one_src(src_seq)
-                all_tokens.append(token)
-
-        # send total count + token IDs (dst needs them for Sequence)
-        if self.rank == 0:
-            total_t = torch.tensor([len(all_tokens)], dtype=torch.int64, device=f"cuda:{device}")
+            total_t = torch.tensor([N], dtype=torch.int64, device=f"cuda:{device}")
             dist.send(total_t, dst=1)
-            ids_t = torch.tensor(all_tokens, dtype=torch.int64, device=f"cuda:{device}")
+            ids_t = torch.tensor(token_ids, dtype=torch.int64, device=f"cuda:{device}")
             dist.send(ids_t, dst=1)
         else:
             total_t = torch.empty(1, dtype=torch.int64, device=f"cuda:{device}")
             dist.recv(total_t, src=0)
             ids_t = torch.empty(total_t.item(), dtype=torch.int64, device=f"cuda:{device}")
             dist.recv(ids_t, src=0)
-            all_tokens = ids_t.tolist()
 
-        # Phase 2: pack all KV and transfer
-        total_len = len(all_tokens)
-        num_blocks = math.ceil(total_len / self.block_size)
-
-        buf = torch.empty(
-            *self.kv_block_shape[:-3], num_blocks,
-            *self.kv_block_shape[-3:],
-            dtype=self.kv_dtype, device=f"cuda:{device}")
-
+        # Phase 2: src packs KV and transfers; dst receives and unpacks
         if self.rank == 0:
-            while len(src_seq.block_table) < num_blocks:
-                src_seq.block_table.append(self.src_bm._allocate_block())
             with torch.cuda.device(device):
                 for i in range(num_blocks):
                     src_bid = src_seq.block_table[i]
@@ -486,28 +491,47 @@ class MigrationEngine:
 
         dst_seq = None
         if self.rank == 1:
+            recv_ids = ids_t.tolist()
             with torch.cuda.device(device):
-                # recv real data
+                # recv real data (round 1)
                 dist.recv(buf, src=0)
-                # allocate blocks and unpack
-                dst_seq = Sequence(all_tokens)
+                # allocate dst blocks and unpack
+                dst_seq = Sequence(recv_ids)
                 for _ in range(dst_seq.num_blocks):
                     dst_seq.block_table.append(self.dst_bm._allocate_block())
                 for i in range(num_blocks):
                     dst_bid = dst_seq.block_table[i]
                     self.dst.kv_cache[:, :, dst_bid].copy_(buf[:, :, i])
                 # K-1 padding rounds
+                torch.cuda.current_stream().synchronize()
                 for _ in range(K - 1):
                     dist.recv(buf, src=0)
                 torch.cuda.synchronize()
-                dst_seq.num_cached_tokens = total_len
+                dst_seq.num_cached_tokens = N
                 dst_seq.num_scheduled_tokens = 0
                 dst_seq.is_prefill = False
 
-        t_total = (time.perf_counter() - t_start) * 1000 if self.rank == 1 else 0.0
-        stats = {"num_rounds": 0, "src_decoded": max_decode, "dst_decoded": 0}
-        return t_total, dst_seq, stats
+        # Phase 3: dst decodes max_decode steps
+        dst_decoded = 0
+        if self.rank == 1:
+            with torch.cuda.device(device):
+                for _ in range(max_decode):
+                    self.dst_bm.may_append(dst_seq)
+                    dst_seq.num_scheduled_tokens = 1
+                    dst_seq.is_prefill = False
+                    inp, pos = self.dst.prepare_decode([dst_seq])
+                    logits = self.dst.run_model(inp, pos, is_prefill=False)
+                    reset_context()
+                    token = logits[0].argmax().item()
+                    dst_seq.num_cached_tokens += 1
+                    dst_seq.append_token(token)
+                    dst_decoded += 1
+                torch.cuda.synchronize()
 
+        t_total = (time.perf_counter() - t_start) * 1000 if self.rank == 1 else 0.0
+        stats = {"num_rounds": 0, "src_decoded": 0, "dst_decoded": dst_decoded}
+        return t_total, dst_seq, stats
+       
     # ------------------------------------------------------------------ #
     #  Greedy decode (used for correctness check, runs on one rank)
     # ------------------------------------------------------------------ #
