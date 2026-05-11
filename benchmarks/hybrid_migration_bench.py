@@ -10,7 +10,7 @@ Usage (single-machine, 2 GPUs, --profile is optional):
     python benchmarks/hybrid_migration_bench.py \
         --model ./Qwen3-4B \
         --block-size 256 \
-        --bandwidth-scale 4 \
+        --bandwidth-scale 3 \
         --num-repeats 5 \
         --output-dir results
 
