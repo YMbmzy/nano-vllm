@@ -284,6 +284,19 @@ class MigrationEngine:
 
             # -- rank 0: pack src KV --
             if self.rank == 0 and buf is not None:
+                # src may have decoded new tokens in previous rounds.
+                # Ensure block_table keeps up with current sequence length
+                # before indexing absolute transfer blocks.
+                while len(src_seq.block_table) < src_seq.num_blocks:
+                    src_seq.block_table.append(self.src_bm._allocate_block())
+                need_blocks = abs_start_block + num_transfer_blocks
+                if need_blocks > len(src_seq.block_table):
+                    raise RuntimeError(
+                        "src block table too short for transfer: "
+                        f"need={need_blocks}, have={len(src_seq.block_table)}, "
+                        f"round={round_num}, M={M}, migrated_up_to={migrated_up_to}, "
+                        f"src_tokens={src_seq.num_tokens}, src_blocks={src_seq.num_blocks}"
+                    )
                 with torch.cuda.device(device):
                     for i in range(num_transfer_blocks):
                         src_bid = src_seq.block_table[abs_start_block + i]
