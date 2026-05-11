@@ -229,50 +229,41 @@ class MigrationEngine:
 
         # ============================================================ #
         #  Phase 1: iterative catch-up rounds
-        #  Exit when M < min_catchup_tokens (that round uses α=0).
-        #
-        #  CAVEAT: for α=0 (pure KV) and α=1 (pure token), the catch-up
-        #  protocol adds overhead without compute/transfer overlap.
-        #  Also, the min_catchup_tokens exit forces α=0 on the final
-        #  round regardless of strategy, so α=1 is not truly pure here.
+        #  新退出条件：仅当 src 已经解码满 max_decode 且有残余 KV 时才强制 pure transfer
         # ============================================================ #
-        t_start = None  # set after first barrier
+        t_start = None
 
         while True:
             round_end = len(all_tokens)
             M = round_end - migrated_up_to
-            if M == 0:
+
+            # ---- 正常退出：所有 KV 已传输且 src 解码完毕 ----
+            if M == 0 and src_decoded >= max_decode:
                 break
 
-            # -- resolve α for this round --
-            force_exit = False
-            if M < min_catchup_tokens and round_num > 0:
-                round_alpha = 0.0    # pure transfer, skip compute overhead
-                force_exit = True    # last catch-up round
-            elif alpha_fn is not None:
-                round_alpha = alpha_fn(M)
+            # ---- 若 src 已完成但剩余 KV → 最后纯传输 ----
+            if src_decoded >= max_decode and M > 0:
+                round_alpha = 0.0
+                force_exit = True
             else:
-                round_alpha = alpha
+                force_exit = False
+                # 原 min_catchup_tokens 逻辑已删除，不再强制提前退出
+                if alpha_fn is not None:
+                    round_alpha = alpha_fn(max(M, 1))   # 避免 M=0
+                else:
+                    round_alpha = alpha
 
-            # -- compute split for this round's M tokens --
+            # ---- 计算本轮 split ----
             split_idx = self.compute_split(M, round_alpha)
-
-            # All block arithmetic in absolute coordinates to handle
-            # non-block-aligned migrated_up_to correctly.
             end_token = migrated_up_to + M
             end_block_abs = math.ceil(end_token / self.block_size)
-
-            # Snap split to absolute block boundary to avoid recompute/transfer
-            # writing to the same block in parallel (race condition).
             abs_split_token = migrated_up_to + split_idx
             abs_transfer_start = math.ceil(abs_split_token / self.block_size)
             split_idx = min(abs_transfer_start * self.block_size - migrated_up_to, M)
-
             num_transfer_blocks = end_block_abs - abs_transfer_start
             abs_start_block = abs_transfer_start
 
-            # -- prepare transfer buffer --
-            # NOTE: last block's trailing slots may be uninitialised (see migrate()).
+            # 分配 transfer buffer
             if num_transfer_blocks > 0:
                 buf = torch.empty(
                     *self.kv_block_shape[:-3], num_transfer_blocks,
@@ -281,91 +272,67 @@ class MigrationEngine:
             else:
                 buf = None
 
-            # -- rank 0: pack src KV --
+            # rank 0 打包 src KV
             if self.rank == 0 and buf is not None:
-                # src may have decoded new tokens in previous rounds.
-                # Ensure block_table keeps up with current sequence length
-                # before indexing absolute transfer blocks.
                 while len(src_seq.block_table) < src_seq.num_blocks:
                     src_seq.block_table.append(self.src_bm._allocate_block())
                 need_blocks = abs_start_block + num_transfer_blocks
                 if need_blocks > len(src_seq.block_table):
-                    raise RuntimeError(
-                        "src block table too short for transfer: "
-                        f"need={need_blocks}, have={len(src_seq.block_table)}, "
-                        f"round={round_num}, M={M}, migrated_up_to={migrated_up_to}, "
-                        f"src_tokens={src_seq.num_tokens}, src_blocks={src_seq.num_blocks}"
-                    )
+                    raise RuntimeError(...)
                 with torch.cuda.device(device):
                     for i in range(num_transfer_blocks):
                         src_bid = src_seq.block_table[abs_start_block + i]
                         buf[:, :, i].copy_(self.src.kv_cache[:, :, src_bid])
                     torch.cuda.synchronize()
 
-            # -- done signal buffer (rank 0 receives, rank 1 sends) --
             done_buf = torch.empty(1, dtype=torch.int32, device=f"cuda:{device}")
 
-            # ---- barrier: start round ----
             dist.barrier()
-
-            # start timer after first barrier — no cuda.synchronize here so
-            # we don't exclude any GPU work that starts immediately after barrier
-            if t_start is None:
-                if self.rank == 1:
-                    t_start = time.perf_counter()
+            if t_start is None and self.rank == 1:
+                t_start = time.perf_counter()
 
             new_tokens = []
 
             if self.rank == 0:
-                # --- src: non-blocking isend + decode on the main thread ---
-                # NCCL kernels run on their own internal stream, so isend
-                # returns immediately on the CPU side and lets the main
-                # thread keep launching decode work on the default stream.
-                # This gives real CPU/GPU overlap without the Python-thread
-                # + ProcessGroupNCCL race that caused the heap corruption
-                # in the previous threaded implementation.
+                # ---- src 端 ----
                 send_works = []
                 if buf is not None:
                     for _ in range(K):
                         send_works.append(dist.isend(buf, dst=1))
 
-                # Decode while the NCCL sends are in flight. Stop as soon
-                # as all sends have completed so we hand control back to
-                # the round-finalization code promptly.
+                # 提前发出 irecv，以便在解码期间接收 done 信号
+                recv_done_work = dist.irecv(done_buf, src=1)
+
+                # 解码循环：一直解码直到 (a) 达到 max_decode 或
+                # (b) 发送已完成 且 done 信号也已到达（本轮可结束）
                 while src_decoded < max_decode:
                     token = self.decode_one_src(src_seq)
                     new_tokens.append(token)
                     src_decoded += 1
-                    if not send_works or all(w.is_completed() for w in send_works):
+
+                    # 检查是否可以提前结束本轮
+                    sends_done = (not send_works) or all(w.is_completed() for w in send_works)
+                    if sends_done and recv_done_work.is_completed():
                         break
 
-                # Safety net: wait on anything still pending. wait() is a
-                # no-op for works that already completed.
+                # 确保所有操作完成
                 for w in send_works:
                     w.wait()
+                recv_done_work.wait()
 
-                # Blocking recv for dst's done signal — no concurrency
-                # concerns here, the main thread is otherwise idle.
-                dist.recv(done_buf, src=1)
-
-            else:  # rank == 1
-                # --- dst: recv + recompute + unpack + signal done ---
+            else:   # rank == 1 (dst)
+                # ---- dst 端保持不变 ----
                 with torch.cuda.device(device):
                     recv_work = None
                     if buf is not None:
                         recv_work = dist.irecv(buf, src=0)
 
-                    # recompute on compute stream
                     compute_stream = torch.cuda.Stream()
                     if split_idx > 0:
                         recompute_end = migrated_up_to + split_idx
-                        recompute_blocks_end = abs_transfer_start  # = abs_start_block
-                        # token_ids must be the full prefix [0, recompute_end)
-                        # so prepare_prefill can index seq[num_cached_tokens:]
-                        # and positions/RoPE start from the correct offset
+                        recompute_blocks_end = abs_transfer_start
                         recompute_seq = Sequence(all_tokens[:recompute_end])
-                        recompute_seq.block_table = list(
-                            dst_seq.block_table[:recompute_blocks_end])
+                        recompute_seq.block_table = list(dst_seq.block_table[:recompute_blocks_end])
                         recompute_seq.num_cached_tokens = migrated_up_to
                         recompute_seq.num_scheduled_tokens = split_idx
                         with torch.cuda.stream(compute_stream):
@@ -373,14 +340,12 @@ class MigrationEngine:
                             self.dst.run_model(inp, pos, is_prefill=True)
                             reset_context()
 
-                    # wait recv, unpack
                     if recv_work is not None:
                         recv_work.wait()
                         for i in range(num_transfer_blocks):
                             dst_bid = dst_seq.block_table[abs_start_block + i]
                             self.dst.kv_cache[:, :, dst_bid].copy_(buf[:, :, i])
 
-                    # K-1 padding recvs
                     if buf is not None:
                         torch.cuda.current_stream().synchronize()
                         for _ in range(K - 1):
@@ -390,17 +355,14 @@ class MigrationEngine:
                     compute_stream.synchronize()
                     torch.cuda.synchronize()
 
-                    # signal src that round is done
                     done_buf.fill_(1)
                     done_send_work = dist.isend(done_buf, dst=0)
                     done_send_work.wait()
 
-            # ---- exchange new tokens (pure P2P, avoid collective mixing) ----
+            # ---- 交换新 token（不变） ----
             if self.rank == 0:
-                new_count_t = torch.tensor(
-                    [len(new_tokens)], dtype=torch.int64, device=f"cuda:{device}")
-                count_send_work = dist.isend(new_count_t, dst=1)
-                count_send_work.wait()
+                new_count_t = torch.tensor([len(new_tokens)], dtype=torch.int64, device=f"cuda:{device}")
+                dist.isend(new_count_t, dst=1).wait()
             else:
                 new_count_t = torch.empty(1, dtype=torch.int64, device=f"cuda:{device}")
                 dist.recv(new_count_t, src=0)
@@ -408,38 +370,30 @@ class MigrationEngine:
 
             if new_count > 0:
                 if self.rank == 0:
-                    new_ids_t = torch.tensor(
-                        new_tokens, dtype=torch.int64, device=f"cuda:{device}")
-                    ids_send_work = dist.isend(new_ids_t, dst=1)
-                    ids_send_work.wait()
+                    new_ids_t = torch.tensor(new_tokens, dtype=torch.int64, device=f"cuda:{device}")
+                    dist.isend(new_ids_t, dst=1).wait()
                 else:
-                    new_ids_t = torch.empty(
-                        new_count, dtype=torch.int64, device=f"cuda:{device}")
+                    new_ids_t = torch.empty(new_count, dtype=torch.int64, device=f"cuda:{device}")
                     dist.recv(new_ids_t, src=0)
-
                 new_ids = new_ids_t.tolist()
                 all_tokens.extend(new_ids)
 
-                # rank 1: grow dst_seq
                 if self.rank == 1:
                     for tid in new_ids:
                         dst_seq.token_ids.append(tid)
                         dst_seq.num_tokens += 1
                         dst_seq.last_token = tid
-                    # allocate new blocks as needed
                     while len(dst_seq.block_table) < dst_seq.num_blocks:
                         dst_seq.block_table.append(self.dst_bm._allocate_block())
 
             migrated_up_to = round_end
             round_num += 1
-
-            # also track src_decoded on rank 1 (from broadcast)
             if self.rank == 1:
                 src_decoded += new_count
 
             if force_exit:
                 break
-
+            
         # ============================================================ #
         #  Phase 1.5: handoff — recompute leftover tokens on dst
         #  (tokens src decoded after last migrated round_end)
