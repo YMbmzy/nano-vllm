@@ -325,10 +325,14 @@ class MigrationEngine:
                 src_device = self.src.rank
                 def _nccl_src_work():
                     torch.cuda.set_device(src_device)
+                    send_works = []
                     if buf is not None:
                         for _ in range(K):
-                            dist.send(buf, dst=1)
-                    dist.recv(done_buf, src=1)  # blocks until dst signals done
+                            send_works.append(dist.isend(buf, dst=1))
+                    done_work = dist.irecv(done_buf, src=1)
+                    for w in send_works:
+                        w.wait()
+                    done_work.wait()  # wait until dst signals this round done
 
                 nccl_thread = threading.Thread(target=_nccl_src_work)
                 nccl_thread.start()
@@ -380,29 +384,38 @@ class MigrationEngine:
                     if buf is not None:
                         torch.cuda.current_stream().synchronize()
                         for _ in range(K - 1):
-                            dist.recv(buf, src=0)
+                            pad_work = dist.irecv(buf, src=0)
+                            pad_work.wait()
 
                     compute_stream.synchronize()
                     torch.cuda.synchronize()
 
                     # signal src that round is done
                     done_buf.fill_(1)
-                    dist.send(done_buf, dst=0)
+                    done_send_work = dist.isend(done_buf, dst=0)
+                    done_send_work.wait()
 
-            # ---- exchange new tokens ----
-            new_count_t = torch.tensor(
-                [len(new_tokens)], dtype=torch.int64, device=f"cuda:{device}")
-            dist.broadcast(new_count_t, src=0)
+            # ---- exchange new tokens (pure P2P, avoid collective mixing) ----
+            if self.rank == 0:
+                new_count_t = torch.tensor(
+                    [len(new_tokens)], dtype=torch.int64, device=f"cuda:{device}")
+                count_send_work = dist.isend(new_count_t, dst=1)
+                count_send_work.wait()
+            else:
+                new_count_t = torch.empty(1, dtype=torch.int64, device=f"cuda:{device}")
+                dist.recv(new_count_t, src=0)
             new_count = new_count_t.item()
 
             if new_count > 0:
                 if self.rank == 0:
                     new_ids_t = torch.tensor(
                         new_tokens, dtype=torch.int64, device=f"cuda:{device}")
+                    ids_send_work = dist.isend(new_ids_t, dst=1)
+                    ids_send_work.wait()
                 else:
                     new_ids_t = torch.empty(
                         new_count, dtype=torch.int64, device=f"cuda:{device}")
-                dist.broadcast(new_ids_t, src=0)
+                    dist.recv(new_ids_t, src=0)
 
                 new_ids = new_ids_t.tolist()
                 all_tokens.extend(new_ids)
