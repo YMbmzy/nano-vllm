@@ -266,12 +266,13 @@ class MigrationEngine:
                 # receiving/unpacking this round's KV.
                 done_recv = dist.irecv(done_t, src=1)
                 if should_decode:
-                    while src_decoded < max_decode:
-                        if done_recv.is_completed():
-                            break
-                        token = self.decode_one_src(src_seq)
-                        new_tokens.append(token)
-                        src_decoded += 1
+                    with torch.cuda.stream(self.compute_stream):
+                        while src_decoded < max_decode:
+                            if done_recv.is_completed():
+                                break
+                            token = self.decode_one_src(src_seq)
+                            new_tokens.append(token)
+                            src_decoded += 1
                 done_recv.wait()
 
             else:  # rank 1 (dst)
