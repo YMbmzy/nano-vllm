@@ -325,14 +325,10 @@ class MigrationEngine:
                 src_device = self.src.rank
                 def _nccl_src_work():
                     torch.cuda.set_device(src_device)
-                    send_works = []
                     if buf is not None:
                         for _ in range(K):
-                            send_works.append(dist.isend(buf, dst=1))
-                    done_work = dist.irecv(done_buf, src=1)
-                    for w in send_works:
-                        w.wait()
-                    done_work.wait()  # wait until dst signals this round done
+                            dist.send(buf, dst=1)
+                    dist.recv(done_buf, src=1)  # wait until dst signals this round done
 
                 nccl_thread = threading.Thread(target=_nccl_src_work)
                 nccl_thread.start()
