@@ -231,6 +231,11 @@ class MigrationEngine:
         # ============================================================ #
         #  Phase 1: iterative catch-up rounds
         #  Exit when M < min_catchup_tokens (that round uses α=0).
+        #
+        #  CAVEAT: for α=0 (pure KV) and α=1 (pure token), the catch-up
+        #  protocol adds overhead without compute/transfer overlap.
+        #  Also, the min_catchup_tokens exit forces α=0 on the final
+        #  round regardless of strategy, so α=1 is not truly pure here.
         # ============================================================ #
         t_start = None  # set after first barrier
 
