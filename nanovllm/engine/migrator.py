@@ -258,22 +258,22 @@ class MigrationEngine:
             done_t = torch.empty(1, dtype=torch.int32, device=f"cuda:{device}")
 
             if self.rank == 0:
+                send_works = []
                 if buf is not None:
                     for _ in range(K):
-                        dist.send(buf, dst=1)
+                        send_works.append(dist.isend(buf, dst=1))
 
-                # Round-done signal from dst: decode only until dst finishes
-                # receiving/unpacking this round's KV.
                 done_recv = dist.irecv(done_t, src=1)
                 if should_decode:
-                    with torch.cuda.stream(self.compute_stream):
-                        while src_decoded < max_decode:
-                            if done_recv.is_completed():
-                                break
-                            token = self.decode_one_src(src_seq)
-                            new_tokens.append(token)
-                            src_decoded += 1
+                    while src_decoded < max_decode:
+                        if done_recv.is_completed():
+                            break
+                        token = self.decode_one_src(src_seq)
+                        new_tokens.append(token)
+                        src_decoded += 1
                 done_recv.wait()
+                for w in send_works:
+                    w.wait()
 
             else:  # rank 1 (dst)
                 with torch.cuda.device(device):
@@ -287,9 +287,10 @@ class MigrationEngine:
 
                     # K-1 padding recvs (blocking, matches rank 0 blocking sends)
                     if buf is not None:
-                        torch.cuda.current_stream().synchronize()
-                        for _ in range(K - 1):
-                            dist.recv(buf, src=0)
+                        torch.cuda.current_stream().synchronize()  # 保留：防止 unpack 还在读 buf 时 NCCL 覆盖写
+                        pad_works = [dist.irecv(buf, src=0) for _ in range(K - 1)]
+                        for w in pad_works:
+                            w.wait()
 
                     torch.cuda.synchronize()
                     done_t.fill_(1)
