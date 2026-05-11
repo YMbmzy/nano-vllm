@@ -10,7 +10,7 @@ Usage (single-machine, 2 GPUs, --profile / --iterative is optional):
     python benchmarks/hybrid_migration_bench.py \
         --model ./Qwen3-4B \
         --block-size 256 \
-        --bandwidth-scale 3 \
+        --bandwidth-scale 4 \
         --num-repeats 5 \
         --profile \
         --iterative \
@@ -550,20 +550,28 @@ def plot_exp2(results: list[dict], alpha_star, output_path: str):
 
 
 # ====================================================================== #
-#  Experiment 3: end-to-end with iterative catch-up
+#  Experiment 3: decode-phase migration — three strategies
 # ====================================================================== #
 
-def run_one_iterative(engine: MigrationEngine, token_ids: list[int],
-                      alpha: float, max_decode: int,
-                      alpha_fn=None,
-                      min_catchup_tokens: int = 1024) -> tuple[float, dict]:
-    """Run one iterative migration. Returns (T_total_ms, stats) on rank 1."""
+def _run_exp3_one(engine: MigrationEngine, strategy: str,
+                  token_ids: list[int], max_decode: int) -> tuple[float, dict]:
+    """Run one exp3 data point. Returns (T_total_ms, stats) on rank 1."""
     src_seq = None
     if engine.rank == 0:
         src_seq = engine.prefill_src(token_ids)
-    t, dst_seq, stats = engine.migrate_iterative(
-        token_ids, alpha, src_seq=src_seq, max_decode=max_decode,
-        alpha_fn=alpha_fn, min_catchup_tokens=min_catchup_tokens)
+
+    if strategy == "token_migration":
+        t, dst_seq, stats = engine.migrate_token_migration(
+            token_ids, src_seq=src_seq, max_decode=max_decode)
+    elif strategy == "deferred_kv":
+        t, dst_seq, stats = engine.migrate_deferred_kv(
+            token_ids, src_seq=src_seq, max_decode=max_decode)
+    elif strategy == "iterative_kv":
+        t, dst_seq, stats = engine.migrate_iterative(
+            token_ids, src_seq=src_seq, max_decode=max_decode)
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
     dist.barrier()
     if engine.rank == 0:
         engine.cleanup_src(src_seq)
@@ -573,53 +581,56 @@ def run_one_iterative(engine: MigrationEngine, token_ids: list[int],
     return (t, stats) if engine.rank == 1 else (0.0, stats)
 
 
-def verify_iterative_migration(engine: MigrationEngine, token_ids: list[int],
-                                alpha: float, max_decode: int) -> bool:
-    """方案B：独立比较 dst 生成的 max_decode 个 token 与纯 src 解码结果。
-
-    rank 0: prefill + 独立解码 max_decode 个 token → 基线
-    rank 1: 执行 migrate_iterative，dst 端得到 N + max_decode 个 token
-    比较 dst 端新增的 max_decode 个 token 是否与基线一致。
-    """
+def verify_exp3(engine, token_ids, strategy, max_decode):
     N = len(token_ids)
+    # Both ranks execute the migration strategy together.
+    src_seq = None
     if engine.rank == 0:
-        # 1. prefill 构建 KV cache
         src_seq = engine.prefill_src(token_ids)
-        # 2. 独立解码 max_decode 个 token 作为基线
-        baseline = engine.greedy_decode(engine.src, engine.src_bm, src_seq, max_decode)
-        device = f"cuda:{engine.src.rank}"
-        baseline_t = torch.tensor(baseline, dtype=torch.int64, device=device)
-        # 发送基线给 rank 1
+
+    if strategy == "token_migration":
+        _, dst_seq, _ = engine.migrate_token_migration(
+            token_ids, src_seq=src_seq, max_decode=max_decode)
+    elif strategy == "deferred_kv":
+        _, dst_seq, _ = engine.migrate_deferred_kv(
+            token_ids, src_seq=src_seq, max_decode=max_decode)
+    elif strategy == "iterative_kv":
+        _, dst_seq, _ = engine.migrate_iterative(
+            token_ids, src_seq=src_seq, max_decode=max_decode)
+    else:
+        raise ValueError(strategy)
+
+    if engine.rank == 0:
+        # After migration, src_seq still holds all tokens + KV.
+        baseline = src_seq.token_ids[N:N+max_decode]
+        baseline_t = torch.tensor(baseline, dtype=torch.int64,
+                                  device=f'cuda:{engine.src.rank}')
         dist.send(baseline_t, dst=1)
         engine.cleanup_src(src_seq)
         return True
-    else:   # rank == 1
-        # 1. 执行迭代迁移（内部会由 dst 解码完剩余的 max_decode - src_decoded 个 token）
-        _, dst_seq, stats = engine.migrate_iterative(
-            token_ids, alpha, src_seq=None, max_decode=max_decode)
-        # 2. 取出迁移后 dst 新增的所有 token（N 之后的部分）
-        migrated = dst_seq.token_ids[N:]   # 长度应为 max_decode
-        # 3. 接收基线
-        device = f"cuda:{engine.dst.rank}"
-        baseline_t = torch.empty(max_decode, dtype=torch.int64, device=device)
+    else:
+        baseline_t = torch.empty(max_decode, dtype=torch.int64,
+                                 device=f'cuda:{engine.dst.rank}')
         dist.recv(baseline_t, src=0)
         baseline = baseline_t.tolist()
-        engine.cleanup_dst(dst_seq)
-        ok = (migrated == baseline)
+        migrated = dst_seq.token_ids[N:N+max_decode]
+        ok = (len(migrated) == max_decode and migrated == baseline)
         if not ok:
-            print(f"  [rank 1] ITERATIVE MISMATCH: "
-                  f"baseline={baseline[:10]}... "
+            print(f"Mismatch: baseline={baseline[:10]}... "
                   f"migrated={migrated[:10]}...")
+        engine.cleanup_dst(dst_seq)
         return ok
 
 
 def run_exp3(engine: MigrationEngine, prompt_tokens: list[int],
-             alpha_star: float, num_repeats: int,
-             alpha_fn=None,
-             min_catchup_tokens: int = 1024) -> list[dict]:
-    """End-to-end benchmark: prefill N + decode N with iterative catch-up."""
+             num_repeats: int) -> list[dict]:
+    """Decode-phase migration: token migration vs deferred KV vs iterative KV.
+
+    For each N: src has N prefilled tokens and decodes N more.
+    T_migration = total time from trigger to dst ready.
+    """
     Ns = [1024, 2048, 4096, 8192, 8192 * 2]
-    strategies = {"kv_migration": 0.0, "token_migration": 1.0, "hybrid": alpha_star}
+    strategies = ["token_migration", "deferred_kv", "iterative_kv"]
     results = []
 
     for N in Ns:
@@ -629,55 +640,53 @@ def run_exp3(engine: MigrationEngine, prompt_tokens: list[int],
             continue
 
         token_ids = prompt_tokens[:N]
-        max_decode = N  # decode exactly N tokens
+        # Fix it
+        max_decode = 1024
 
-        for name, alpha in strategies.items():
-            # alpha_fn only applies to hybrid strategy
-            fn = alpha_fn if name == "hybrid" else None
+        for strat in strategies:
             # warmup
-            run_one_iterative(engine, token_ids, alpha, max_decode,
-                              fn, min_catchup_tokens)
+            _run_exp3_one(engine, strat, token_ids, max_decode)
 
             times = []
             all_stats = []
             for _ in range(num_repeats):
-                t, stats = run_one_iterative(engine, token_ids, alpha, max_decode,
-                                             fn, min_catchup_tokens)
+                t, stats = _run_exp3_one(engine, strat, token_ids, max_decode)
                 times.append(t)
                 all_stats.append(stats)
 
             if engine.rank == 1:
                 times.sort()
                 mid = len(times) // 2
-                r = dict(N=N, strategy=name, alpha=alpha,
+                r = dict(N=N, strategy=strat,
                          median=times[mid], min=min(times), max=max(times),
-                         all=times,
-                         num_rounds=all_stats[mid]["num_rounds"],
-                         src_decoded=all_stats[mid]["src_decoded"],
-                         dst_decoded=all_stats[mid]["dst_decoded"])
+                         all=times, stats=all_stats[mid])
                 results.append(r)
-                print(f"  N={N} {name:20s} (α={alpha:.2f}): "
+                s = all_stats[mid]
+                print(f"  N={N} {strat:20s}: "
                       f"median={r['median']:.2f} ms  "
                       f"[{r['min']:.2f}, {r['max']:.2f}]  "
-                      f"rounds={r['num_rounds']} "
-                      f"src={r['src_decoded']} dst={r['dst_decoded']}")
+                      f"rounds={s.get('num_rounds', '-')} "
+                      f"src={s.get('src_decoded', '-')} "
+                      f"dst={s.get('dst_decoded', '-')}")
 
     return results
 
 
-def plot_exp3(results: list[dict], alpha_star: float, output_path: str):
+def plot_exp3(results: list[dict], output_path: str):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    labels = {"kv_migration": "KV Migration (α=0)",
-              "token_migration": "Token Migration (α=1)",
-              "hybrid": f"Hybrid (α={alpha_star:.2f})"}
-    colors = {"kv_migration": "#1f77b4", "token_migration": "#ff7f0e", "hybrid": "#2ca02c"}
-    markers = {"kv_migration": "s", "token_migration": "^", "hybrid": "o"}
+    labels = {
+        "token_migration": "Token Migration\n(dst prefills all)",
+        "deferred_kv": "Deferred KV Transfer\n(src finishes, then sends)",
+        "iterative_kv": "Iterative KV (ours)\n(transfer while decoding)",
+    }
+    colors = {"token_migration": "#ff7f0e", "deferred_kv": "#1f77b4", "iterative_kv": "#2ca02c"}
+    markers = {"token_migration": "^", "deferred_kv": "s", "iterative_kv": "o"}
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    for strat in ["kv_migration", "token_migration", "hybrid"]:
+    for strat in ["token_migration", "deferred_kv", "iterative_kv"]:
         data = [r for r in results if r["strategy"] == strat]
         if not data:
             continue
@@ -688,9 +697,9 @@ def plot_exp3(results: list[dict], alpha_star: float, output_path: str):
         ax.errorbar(Ns, med, yerr=[lo, hi], marker=markers[strat], capsize=3,
                     linewidth=2, label=labels[strat], color=colors[strat])
 
-    ax.set_xlabel("Sequence Length N (prefill = decode = N)", fontsize=12)
-    ax.set_ylabel("T_total (ms)", fontsize=12)
-    ax.set_title("End-to-End Migration Time (iterative catch-up)", fontsize=14)
+    ax.set_xlabel("Sequence Length N (prefill N, then decode N)", fontsize=12)
+    ax.set_ylabel("T_migration (ms)", fontsize=12)
+    ax.set_title("Decode-Phase Migration: Total Migration Time", fontsize=14)
     ax.set_xscale("log", base=2)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
@@ -897,41 +906,22 @@ def worker_fn(rank: int, world_size: int, args, result_queue):
         alpha_star_out = alpha_star
 
     # ============================================================ #
-    #  Experiment 3: iterative catch-up (optional)
+    #  Experiment 3: decode-phase migration (optional)
     # ============================================================ #
     exp3_results = []
     if args.iterative:
-        # resolve α* for exp3
-        if isinstance(alpha_star_out, dict):
-            exp3_alpha = profile_info["bruteforce_alpha_exp1"]
-        else:
-            exp3_alpha = alpha_star_out
-
-        # build per-round alpha_fn if profiling data available
-        exp3_alpha_fn = None
-        if profile_info:
-            _c = tuple(profile_info["c_params"])
-            _t = tuple(profile_info["t_params"])
-            _bs = engine.block_size
-            exp3_alpha_fn = lambda M, c=_c, t=_t, bs=_bs: predict_alpha_star(M, bs, c, t)
-
-        min_ct = args.min_catchup_tokens
-
-        # correctness check
+        # correctness check for all three strategies
         if rank == 1:
-            print("\n=== Exp3 correctness check (iterative, α=0.5) ===")
+            print("\n=== Exp3 correctness check ===")
         N_check = min(1024, len(prompt_tokens))
-        ok = verify_iterative_migration(
-            engine, prompt_tokens[:N_check], alpha=0.5, max_decode=N_check)
-        if rank == 1:
-            print(f"  Result: {'PASS' if ok else 'FAIL'}")
+        for strat in ["token_migration", "deferred_kv", "iterative_kv"]:
+            ok = verify_exp3(engine, prompt_tokens[:N_check], strat, max_decode=N_check)
+            if rank == 1:
+                print(f"  {strat}: {'PASS' if ok else 'FAIL'}")
 
         if rank == 1:
-            mode = "per-round α* from profiling" if exp3_alpha_fn else f"fixed α*={exp3_alpha:.2f}"
-            print(f"\n=== Experiment 3: iterative catch-up ({mode}, "
-                  f"min_catchup={min_ct}) ===")
-        exp3_results = run_exp3(engine, prompt_tokens, exp3_alpha, args.num_repeats,
-                                alpha_fn=exp3_alpha_fn, min_catchup_tokens=min_ct)
+            print(f"\n=== Experiment 3: decode-phase migration ===")
+        exp3_results = run_exp3(engine, prompt_tokens, args.num_repeats)
 
     # ============================================================ #
     #  Collect results
@@ -964,8 +954,8 @@ def worker_fn(rank: int, world_size: int, args, result_queue):
                 plot_exp2(data["exp2"], alpha_star_out,
                           os.path.join(args.output_dir, "exp2_n_sweep.png"))
             if data.get("exp3"):
-                plot_exp3(data["exp3"], data["alpha_star"],
-                          os.path.join(args.output_dir, "exp3_iterative.png"))
+                plot_exp3(data["exp3"],
+                          os.path.join(args.output_dir, "exp3_decode_migration.png"))
 
     dist.barrier()
     dist.destroy_process_group()
@@ -998,9 +988,6 @@ def main():
     parser.add_argument("--no-profile", dest="profile", action="store_false")
     parser.add_argument("--iterative", action="store_true", default=False,
                         help="Run exp3: end-to-end migration with iterative catch-up.")
-    parser.add_argument("--min-catchup-tokens", type=int, default=1024,
-                        help="When remaining tokens < this, final round uses pure "
-                             "KV transfer and exits catch-up (default 1024).")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)

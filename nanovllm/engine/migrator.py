@@ -181,111 +181,74 @@ class MigrationEngine:
         return token
 
     # ------------------------------------------------------------------ #
-    #  Iterative catch-up migration (exp3)
+    #  Iterative catch-up migration (exp3) — pure KV transfer per round
     # ------------------------------------------------------------------ #
-    def migrate_iterative(self, token_ids: list[int], alpha: float,
+    def migrate_iterative(self, token_ids: list[int],
                           src_seq: Sequence | None = None,
                           max_decode: int | None = None,
-                          alpha_fn: 'Callable[[int], float] | None' = None,
-                          min_catchup_tokens: int = 1024,
                           ) -> tuple[float, 'Sequence | None', dict]:
-        """Full end-to-end migration with iterative catch-up.
+        """Pure KV migration with iterative catch-up.
 
-        Phase 1: catch-up rounds — src sends KV + decodes, dst recvs + recomputes.
-                 Exits when M < min_catchup_tokens (final round uses α=0 pure transfer).
-        Phase 2: dst recomputes leftover tokens from last round.
-        Phase 3: dst decodes remaining tokens (max_decode - src_decoded).
+        Each round:
+          rank 0: pack & send KV for pending tokens, decode new tokens in parallel
+          rank 1: recv KV, store into cache
 
-        Args:
-            token_ids: initial prefilled token IDs (length N)
-            alpha: hybrid split ratio (fallback when alpha_fn is None)
-            src_seq: prefilled Sequence on rank 0
-            max_decode: total decode tokens for src (default = len(token_ids))
-            alpha_fn: optional callable(M) → α, for per-round optimal α from profiling
-            min_catchup_tokens: when M < this, do pure KV transfer and exit (default 1024)
+        Exit: when gap (unsent tokens) <= 1, src stops decoding, transfers
+        the final token's KV, migration complete. Then dst decodes remaining.
 
-        Returns:
-            (T_total_ms, dst_seq, stats_dict)
-            - rank 0: (0.0, None, stats)
-            - rank 1: (T_total, dst_seq with full 2N KV, stats)
+        Returns (T_total_ms, dst_seq, stats).
         """
         N = len(token_ids)
         if max_decode is None:
             max_decode = N
         K = self.bandwidth_scale
 
-        all_tokens = list(token_ids)   # grows as src decodes
-        migrated_up_to = 0             # tokens whose KV dst already has
-        src_decoded = 0                # total tokens src has decoded
+        all_tokens = list(token_ids)
+        migrated_up_to = 0
+        src_decoded = 0
         round_num = 0
         device = self.src.rank if self.rank == 0 else self.dst.rank
 
-        # ---- rank 1: create dst_seq with blocks for initial N tokens ----
+        # rank 1: allocate dst blocks for initial N tokens
         dst_seq = None
         if self.rank == 1:
             dst_seq = Sequence(token_ids)
             for _ in range(dst_seq.num_blocks):
                 dst_seq.block_table.append(self.dst_bm._allocate_block())
 
-        # ============================================================ #
-        #  Phase 1: iterative catch-up rounds
-        #  新退出条件：仅当 src 已经解码满 max_decode 且有残余 KV 时才强制 pure transfer
-        # ============================================================ #
         t_start = None
 
         while True:
             round_end = len(all_tokens)
             M = round_end - migrated_up_to
-
-            # ---- 正常退出：所有 KV 已传输且 src 解码完毕 ----
-            if M == 0 and src_decoded >= max_decode:
+            if M == 0:
                 break
 
-            # ---- 若 src 已完成但剩余 KV → 最后纯传输 ----
-            if src_decoded >= max_decode and M > 0:
-                round_alpha = 0.0
-                force_exit = True
-            else:
-                force_exit = False
-                # 原 min_catchup_tokens 逻辑已删除，不再强制提前退出
-                if alpha_fn is not None:
-                    round_alpha = alpha_fn(max(M, 1))   # 避免 M=0
-                else:
-                    round_alpha = alpha
+            # src decodes only if budget remains AND gap > 1
+            should_decode = (src_decoded < max_decode) and (M > 1)
 
-            # ---- 计算本轮 split ----
-            split_idx = self.compute_split(M, round_alpha)
-            end_token = migrated_up_to + M
-            end_block_abs = math.ceil(end_token / self.block_size)
-            abs_split_token = migrated_up_to + split_idx
-            abs_transfer_start = math.ceil(abs_split_token / self.block_size)
-            split_idx = min(abs_transfer_start * self.block_size - migrated_up_to, M)
-            num_transfer_blocks = end_block_abs - abs_transfer_start
-            abs_start_block = abs_transfer_start
+            # block range (floor start to re-send partial block with new slots)
+            start_block = migrated_up_to // self.block_size
+            end_block = math.ceil(round_end / self.block_size)
+            num_transfer_blocks = end_block - start_block
 
-            # 分配 transfer buffer
+            # allocate buffer
+            buf = None
             if num_transfer_blocks > 0:
                 buf = torch.empty(
                     *self.kv_block_shape[:-3], num_transfer_blocks,
                     *self.kv_block_shape[-3:],
                     dtype=self.kv_dtype, device=f"cuda:{device}")
-            else:
-                buf = None
 
-            # rank 0 打包 src KV
+            # rank 0: ensure blocks exist on src, pack into buffer
             if self.rank == 0 and buf is not None:
-                while len(src_seq.block_table) < src_seq.num_blocks:
+                while len(src_seq.block_table) < end_block:
                     src_seq.block_table.append(self.src_bm._allocate_block())
-                need_blocks = abs_start_block + num_transfer_blocks
-                if need_blocks > len(src_seq.block_table):
-                    raise RuntimeError(...)
                 with torch.cuda.device(device):
                     for i in range(num_transfer_blocks):
-                        src_bid = src_seq.block_table[abs_start_block + i]
+                        src_bid = src_seq.block_table[start_block + i]
                         buf[:, :, i].copy_(self.src.kv_cache[:, :, src_bid])
                     torch.cuda.synchronize()
-
-            done_buf = torch.empty(1, dtype=torch.int32, device=f"cuda:{device}")
 
             dist.barrier()
             if t_start is None and self.rank == 1:
@@ -294,88 +257,64 @@ class MigrationEngine:
             new_tokens = []
 
             if self.rank == 0:
-                # ---- src 端 ----
-                send_works = []
+                # first send: isend to overlap with decode
+                send_work = None
                 if buf is not None:
-                    for _ in range(K):
-                        send_works.append(dist.isend(buf, dst=1))
+                    send_work = dist.isend(buf, dst=1)
 
-                # 提前发出 irecv，以便在解码期间接收 done 信号
-                recv_done_work = dist.irecv(done_buf, src=1)
+                # decode while first send is in flight
+                if should_decode:
+                    while src_decoded < max_decode:
+                        token = self.decode_one_src(src_seq)
+                        new_tokens.append(token)
+                        src_decoded += 1
+                        if send_work is not None and send_work.is_completed():
+                            break
 
-                # 解码循环：一直解码直到 (a) 达到 max_decode 或
-                # (b) 发送已完成 且 done 信号也已到达（本轮可结束）
-                while src_decoded < max_decode:
-                    token = self.decode_one_src(src_seq)
-                    new_tokens.append(token)
-                    src_decoded += 1
+                # wait for first send
+                if send_work is not None:
+                    send_work.wait()
 
-                    # 检查是否可以提前结束本轮
-                    sends_done = (not send_works) or all(w.is_completed() for w in send_works)
-                    if sends_done and recv_done_work.is_completed():
-                        break
+                # remaining K-1 sends (blocking, sequential)
+                if buf is not None:
+                    for _ in range(K - 1):
+                        dist.send(buf, dst=1)
 
-                # 确保所有操作完成
-                for w in send_works:
-                    w.wait()
-                recv_done_work.wait()
-
-            else:   # rank == 1 (dst)
-                # ---- dst 端保持不变 ----
+            else:  # rank 1 (dst)
                 with torch.cuda.device(device):
-                    recv_work = None
+                    # first recv (matches rank 0 isend)
                     if buf is not None:
                         recv_work = dist.irecv(buf, src=0)
-
-                    compute_stream = torch.cuda.Stream()
-                    if split_idx > 0:
-                        recompute_end = migrated_up_to + split_idx
-                        recompute_blocks_end = abs_transfer_start
-                        recompute_seq = Sequence(all_tokens[:recompute_end])
-                        recompute_seq.block_table = list(dst_seq.block_table[:recompute_blocks_end])
-                        recompute_seq.num_cached_tokens = migrated_up_to
-                        recompute_seq.num_scheduled_tokens = split_idx
-                        with torch.cuda.stream(compute_stream):
-                            inp, pos = self.dst.prepare_prefill([recompute_seq])
-                            self.dst.run_model(inp, pos, is_prefill=True)
-                            reset_context()
-
-                    if recv_work is not None:
                         recv_work.wait()
                         for i in range(num_transfer_blocks):
-                            dst_bid = dst_seq.block_table[abs_start_block + i]
+                            dst_bid = dst_seq.block_table[start_block + i]
                             self.dst.kv_cache[:, :, dst_bid].copy_(buf[:, :, i])
 
+                    # K-1 padding recvs (blocking, matches rank 0 blocking sends)
                     if buf is not None:
                         torch.cuda.current_stream().synchronize()
                         for _ in range(K - 1):
-                            pad_work = dist.irecv(buf, src=0)
-                            pad_work.wait()
+                            dist.recv(buf, src=0)
 
-                    compute_stream.synchronize()
                     torch.cuda.synchronize()
 
-                    done_buf.fill_(1)
-                    done_send_work = dist.isend(done_buf, dst=0)
-                    done_send_work.wait()
-
-            # ---- 交换新 token（不变） ----
+            # exchange new tokens (blocking send/recv)
             if self.rank == 0:
-                new_count_t = torch.tensor([len(new_tokens)], dtype=torch.int64, device=f"cuda:{device}")
-                dist.isend(new_count_t, dst=1).wait()
+                cnt_t = torch.tensor([len(new_tokens)], dtype=torch.int64, device=f"cuda:{device}")
+                dist.send(cnt_t, dst=1)
             else:
-                new_count_t = torch.empty(1, dtype=torch.int64, device=f"cuda:{device}")
-                dist.recv(new_count_t, src=0)
-            new_count = new_count_t.item()
+                cnt_t = torch.empty(1, dtype=torch.int64, device=f"cuda:{device}")
+                dist.recv(cnt_t, src=0)
+            new_count = cnt_t.item()
 
             if new_count > 0:
                 if self.rank == 0:
-                    new_ids_t = torch.tensor(new_tokens, dtype=torch.int64, device=f"cuda:{device}")
-                    dist.isend(new_ids_t, dst=1).wait()
+                    ids_t = torch.tensor(new_tokens, dtype=torch.int64, device=f"cuda:{device}")
+                    dist.send(ids_t, dst=1)
                 else:
-                    new_ids_t = torch.empty(new_count, dtype=torch.int64, device=f"cuda:{device}")
-                    dist.recv(new_ids_t, src=0)
-                new_ids = new_ids_t.tolist()
+                    ids_t = torch.empty(new_count, dtype=torch.int64, device=f"cuda:{device}")
+                    dist.recv(ids_t, src=0)
+                new_ids = ids_t.tolist() if self.rank == 1 else new_tokens
                 all_tokens.extend(new_ids)
 
                 if self.rank == 1:
@@ -391,53 +330,28 @@ class MigrationEngine:
             if self.rank == 1:
                 src_decoded += new_count
 
-            if force_exit:
-                break
-            
-        # ============================================================ #
-        #  Phase 1.5: handoff — recompute leftover tokens on dst
-        #  (tokens src decoded after last migrated round_end)
-        # ============================================================ #
-        leftover = len(all_tokens) - migrated_up_to
-        if self.rank == 1 and leftover > 0:
-            with torch.cuda.device(device):
-                # allocate blocks for leftover tokens
-                while len(dst_seq.block_table) < dst_seq.num_blocks:
-                    dst_seq.block_table.append(self.dst_bm._allocate_block())
-                # prefix-cached prefill for leftover tokens
-                handoff_seq = Sequence(all_tokens[:migrated_up_to + leftover])
-                handoff_seq.block_table = list(dst_seq.block_table)
-                handoff_seq.num_cached_tokens = migrated_up_to
-                handoff_seq.num_scheduled_tokens = leftover
-                inp, pos = self.dst.prepare_prefill([handoff_seq])
-                self.dst.run_model(inp, pos, is_prefill=True)
-                reset_context()
-        migrated_up_to = len(all_tokens)
-
-        # ============================================================ #
-        #  Phase 2: dst decodes remaining tokens
-        # ============================================================ #
+        # ---- Phase 2: dst decodes remaining tokens ----
         dst_decoded = 0
         if self.rank == 1:
-            # finalize dst_seq cached state
             dst_seq.num_cached_tokens = len(all_tokens)
             dst_seq.num_scheduled_tokens = 0
             dst_seq.is_prefill = False
 
             remaining = max_decode - src_decoded
-            with torch.cuda.device(device):
-                for _ in range(remaining):
-                    self.dst_bm.may_append(dst_seq)
-                    dst_seq.num_scheduled_tokens = 1
-                    dst_seq.is_prefill = False
-                    inp, pos = self.dst.prepare_decode([dst_seq])
-                    logits = self.dst.run_model(inp, pos, is_prefill=False)
-                    reset_context()
-                    token = logits[0].argmax().item()
-                    dst_seq.num_cached_tokens += 1
-                    dst_seq.append_token(token)
-                    dst_decoded += 1
-                torch.cuda.synchronize()
+            if remaining > 0:
+                with torch.cuda.device(device):
+                    for _ in range(remaining):
+                        self.dst_bm.may_append(dst_seq)
+                        dst_seq.num_scheduled_tokens = 1
+                        dst_seq.is_prefill = False
+                        inp, pos = self.dst.prepare_decode([dst_seq])
+                        logits = self.dst.run_model(inp, pos, is_prefill=False)
+                        reset_context()
+                        token = logits[0].argmax().item()
+                        dst_seq.num_cached_tokens += 1
+                        dst_seq.append_token(token)
+                        dst_decoded += 1
+                    torch.cuda.synchronize()
 
         if self.rank == 1 and t_start is not None:
             t_total = (time.perf_counter() - t_start) * 1000
@@ -446,6 +360,152 @@ class MigrationEngine:
 
         stats = {"num_rounds": round_num, "src_decoded": src_decoded,
                  "dst_decoded": dst_decoded}
+        return t_total, dst_seq, stats
+
+    # ------------------------------------------------------------------ #
+    #  Baseline 1 — Token Migration (dst recomputes all KV via prefill)
+    # ------------------------------------------------------------------ #
+    def migrate_token_migration(self, token_ids: list[int],
+                                src_seq: Sequence | None = None,
+                                max_decode: int | None = None,
+                                ) -> tuple[float, 'Sequence | None', dict]:
+        """Baseline: src decodes everything, then dst prefills all tokens.
+
+        T_migration = T_decode(D) + T_send_tokens(~0) + T_prefill(N+D).
+        """
+        N = len(token_ids)
+        if max_decode is None:
+            max_decode = N
+        device = self.src.rank if self.rank == 0 else self.dst.rank
+
+        # ---- sync: migration trigger ----
+        dist.barrier()
+        t_start = time.perf_counter() if self.rank == 1 else None
+
+        # Phase 1: src decodes all tokens (rank 1 idles)
+        all_tokens = list(token_ids)
+        if self.rank == 0:
+            for _ in range(max_decode):
+                token = self.decode_one_src(src_seq)
+                all_tokens.append(token)
+
+        # Phase 2: send token IDs to dst
+        if self.rank == 0:
+            total_t = torch.tensor([len(all_tokens)], dtype=torch.int64, device=f"cuda:{device}")
+            dist.send(total_t, dst=1)
+            ids_t = torch.tensor(all_tokens, dtype=torch.int64, device=f"cuda:{device}")
+            dist.send(ids_t, dst=1)
+        else:
+            total_t = torch.empty(1, dtype=torch.int64, device=f"cuda:{device}")
+            dist.recv(total_t, src=0)
+            ids_t = torch.empty(total_t.item(), dtype=torch.int64, device=f"cuda:{device}")
+            dist.recv(ids_t, src=0)
+            all_tokens = ids_t.tolist()
+
+        # Phase 3: dst prefills all tokens to rebuild KV
+        dst_seq = None
+        if self.rank == 1:
+            with torch.cuda.device(device):
+                dst_seq = Sequence(all_tokens)
+                for _ in range(dst_seq.num_blocks):
+                    dst_seq.block_table.append(self.dst_bm._allocate_block())
+                dst_seq.num_cached_tokens = 0
+                dst_seq.num_scheduled_tokens = len(all_tokens)
+                inp, pos = self.dst.prepare_prefill([dst_seq])
+                self.dst.run_model(inp, pos, is_prefill=True)
+                reset_context()
+                dst_seq.num_cached_tokens = len(all_tokens)
+                dst_seq.num_scheduled_tokens = 0
+                dst_seq.is_prefill = False
+                torch.cuda.synchronize()
+
+        t_total = (time.perf_counter() - t_start) * 1000 if self.rank == 1 else 0.0
+        stats = {"num_rounds": 0, "src_decoded": max_decode, "dst_decoded": 0}
+        return t_total, dst_seq, stats
+
+    # ------------------------------------------------------------------ #
+    #  Baseline 2 — Deferred KV Transfer (src finishes decode, then sends)
+    # ------------------------------------------------------------------ #
+    def migrate_deferred_kv(self, token_ids: list[int],
+                            src_seq: Sequence | None = None,
+                            max_decode: int | None = None,
+                            ) -> tuple[float, 'Sequence | None', dict]:
+        """Baseline: src decodes everything, then transfers complete KV.
+
+        T_migration = T_decode(D) + T_transfer(N+D).
+        """
+        N = len(token_ids)
+        if max_decode is None:
+            max_decode = N
+        K = self.bandwidth_scale
+        device = self.src.rank if self.rank == 0 else self.dst.rank
+
+        # ---- sync: migration trigger ----
+        dist.barrier()
+        t_start = time.perf_counter() if self.rank == 1 else None
+
+        # Phase 1: src decodes all tokens (rank 1 idles)
+        all_tokens = list(token_ids)
+        if self.rank == 0:
+            for _ in range(max_decode):
+                token = self.decode_one_src(src_seq)
+                all_tokens.append(token)
+
+        # send total count + token IDs (dst needs them for Sequence)
+        if self.rank == 0:
+            total_t = torch.tensor([len(all_tokens)], dtype=torch.int64, device=f"cuda:{device}")
+            dist.send(total_t, dst=1)
+            ids_t = torch.tensor(all_tokens, dtype=torch.int64, device=f"cuda:{device}")
+            dist.send(ids_t, dst=1)
+        else:
+            total_t = torch.empty(1, dtype=torch.int64, device=f"cuda:{device}")
+            dist.recv(total_t, src=0)
+            ids_t = torch.empty(total_t.item(), dtype=torch.int64, device=f"cuda:{device}")
+            dist.recv(ids_t, src=0)
+            all_tokens = ids_t.tolist()
+
+        # Phase 2: pack all KV and transfer
+        total_len = len(all_tokens)
+        num_blocks = math.ceil(total_len / self.block_size)
+
+        buf = torch.empty(
+            *self.kv_block_shape[:-3], num_blocks,
+            *self.kv_block_shape[-3:],
+            dtype=self.kv_dtype, device=f"cuda:{device}")
+
+        if self.rank == 0:
+            while len(src_seq.block_table) < num_blocks:
+                src_seq.block_table.append(self.src_bm._allocate_block())
+            with torch.cuda.device(device):
+                for i in range(num_blocks):
+                    src_bid = src_seq.block_table[i]
+                    buf[:, :, i].copy_(self.src.kv_cache[:, :, src_bid])
+                torch.cuda.synchronize()
+            for _ in range(K):
+                dist.send(buf, dst=1)
+
+        dst_seq = None
+        if self.rank == 1:
+            with torch.cuda.device(device):
+                # recv real data
+                dist.recv(buf, src=0)
+                # allocate blocks and unpack
+                dst_seq = Sequence(all_tokens)
+                for _ in range(dst_seq.num_blocks):
+                    dst_seq.block_table.append(self.dst_bm._allocate_block())
+                for i in range(num_blocks):
+                    dst_bid = dst_seq.block_table[i]
+                    self.dst.kv_cache[:, :, dst_bid].copy_(buf[:, :, i])
+                # K-1 padding rounds
+                for _ in range(K - 1):
+                    dist.recv(buf, src=0)
+                torch.cuda.synchronize()
+                dst_seq.num_cached_tokens = total_len
+                dst_seq.num_scheduled_tokens = 0
+                dst_seq.is_prefill = False
+
+        t_total = (time.perf_counter() - t_start) * 1000 if self.rank == 1 else 0.0
+        stats = {"num_rounds": 0, "src_decoded": max_decode, "dst_decoded": 0}
         return t_total, dst_seq, stats
 
     # ------------------------------------------------------------------ #
